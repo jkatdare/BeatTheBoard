@@ -1,16 +1,6 @@
 # BeatTheBoard
 
-I work in NYC and live in NJ, so I take NJ Transit out of Penn Station a lot.
-NJ Transit does not post the track for a departure until about ten minutes
-before it leaves. The moment the track number appears on the board, everyone
-waiting in the concourse moves at once toward the same staircase, and you end
-up in a crowd at the track entrance trying to get down to the platform.
-
-I wanted a tool that would tell me the track before the board did, so I could
-walk down to the platform calmly before the crowd formed.
-
-This is that tool. It shows the NJ Transit departure board for New York Penn
-Station with a predicted track for trains that have not been posted yet.
+I work in NYC and live in NJ, so I take NJ Transit out of Penn Station, and I wanted to get on the train before the crowd of people form. 
 
 ## What it does
 
