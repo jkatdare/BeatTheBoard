@@ -1,5 +1,5 @@
 """
-Track prediction engine + local web app for NY Penn Station.
+Track prediction engine + web app for NY Penn Station.
 
     python engine.py            # serve on http://localhost:8080
     python engine.py --rebuild  # rebuild both codebooks from collected data first
@@ -14,6 +14,18 @@ two places --rebuild can learn the codebooks from:
 
 --rebuild reads whichever exist and merges their votes, so the logger can be
 retired without losing what it already taught the codebooks.
+
+Serving model
+-------------
+The board is fetched from NJT when a request arrives and remembered for
+CACHE_SECONDS, so a burst of refreshes costs two API calls, not two per
+refresh -- and nothing is fetched while nobody is looking. This is what lets
+the app run on a host that switches it off when idle (Azure Container Apps
+scale-to-zero): there is no background loop that needs the process alive.
+
+Two environment variables matter for hosting:
+    BIND   127.0.0.1 (default, this machine only)  |  0.0.0.0 in a container
+    PORT   8080
 
 How it predicts
 ---------------
@@ -61,8 +73,10 @@ import njt_logger as njt
 HISTORY_DB = njt.DB_PATH          # written by run_logger.py (optional)
 BENCH_DB = "benchmark.db"         # written by benchmark.py
 CODEBOOK_PATH = "codebook.json"
+
+BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
-REFRESH_SECONDS = 30
+CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "20"))
 
 GPS_MIN_N, GPS_MIN_PURITY = 3, 0.98    # chosen by held-out sweep
 CKT_MIN_N, CKT_MIN_PURITY = 20, 0.95
@@ -354,21 +368,61 @@ def build_board(books, hist, token):
 
 # -------------------------------------------------------------------- server
 
-STATE = {"board": None, "error": None, "token": None}
+# Fetched on request, remembered for CACHE_SECONDS. A lock so that several
+# simultaneous requests after a cold start trigger one fetch, not one each.
+CACHE = {"board": None, "error": None, "at": 0.0, "token": None}
+CACHE_LOCK = threading.Lock()
+BOOKS, HIST = None, None
 
 
-def refresher(books, hist):
-    while True:
-        try:
-            if not STATE["token"]:
-                STATE["token"] = njt.get_token()
-            STATE["board"] = build_board(books, hist, STATE["token"])
-            STATE["error"] = None
-        except njt.AuthError:
-            STATE["token"] = None
-        except Exception as e:
-            STATE["error"] = type(e).__name__ + ": " + str(e)
-        time.sleep(REFRESH_SECONDS)
+def get_board():
+    with CACHE_LOCK:
+        age = time.time() - CACHE["at"]
+        if CACHE["board"] is not None and age < CACHE_SECONDS:
+            return CACHE["board"], CACHE["error"], round(age)
+        for attempt in (1, 2):
+            try:
+                if not CACHE["token"]:
+                    CACHE["token"] = njt.get_token()
+                CACHE["board"] = build_board(BOOKS, HIST, CACHE["token"])
+                CACHE["error"] = None
+                CACHE["at"] = time.time()
+                break
+            except njt.AuthError:
+                CACHE["token"] = None            # re-mint once, then give up
+                if attempt == 2:
+                    CACHE["error"] = "could not authenticate with NJT"
+            except (Exception, SystemExit) as e:
+                # keep serving the last good board, with the error shown
+                CACHE["error"] = type(e).__name__ + ": " + str(e)
+                CACHE["at"] = time.time()        # do not retry on every request
+                break
+        return CACHE["board"], CACHE["error"], 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/api/board"):
+            board, error, age = get_board()
+            body = json.dumps({"board": board, "error": error, "age": age})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+        elif self.path.startswith("/health"):
+            body = "ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+        else:
+            body = PAGE
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+        data = body.encode("utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -462,26 +516,8 @@ tick(); setInterval(tick, 15000);
 </script></body></html>"""
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def do_GET(self):
-        if self.path.startswith("/api/board"):
-            body = json.dumps({"board": STATE["board"], "error": STATE["error"]})
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-        else:
-            body = PAGE
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-        data = body.encode("utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-
 def main():
+    global BOOKS, HIST
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
@@ -493,12 +529,12 @@ def main():
     args = ap.parse_args()
 
     njt.load_env()
-    books = load_codebooks(rebuild=args.rebuild)
-    hist = load_history()
-    print("history: %d trains" % len(hist))
+    BOOKS = load_codebooks(rebuild=args.rebuild)
+    HIST = load_history()
+    print("history: %d trains" % len(HIST))
 
     if args.once:
-        board = build_board(books, hist, njt.get_token())
+        board = build_board(BOOKS, HIST, njt.get_token())
         print("\n%-7s %-22s %-9s %-7s %-10s %s"
               % ("TRAIN", "DESTINATION", "DEPARTS", "TRACK", "SOURCE", "CIRCUIT"))
         print("-" * 76)
@@ -510,9 +546,9 @@ def main():
                      p["track"] or "--", src, t.get("circuit") or ""))
         return
 
-    threading.Thread(target=refresher, args=(books, hist), daemon=True).start()
-    print("\nserving http://localhost:%d   (Ctrl-C to stop)" % PORT)
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print("\nserving http://%s:%d   (board fetched on request, cached %ds; Ctrl-C to stop)"
+          % ("localhost" if BIND == "127.0.0.1" else BIND, PORT, CACHE_SECONDS))
+    HTTPServer((BIND, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

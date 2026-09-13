@@ -1,0 +1,8 @@
+# Ignore everything, then allow only what the image needs. This matters because
+# `az containerapp up --source .` uploads the whole folder as build context --
+# without this it would try to ship the 3 GB database and the .env file.
+*
+!engine.py
+!njt_logger.py
+!codebook.json
+!Dockerfile
