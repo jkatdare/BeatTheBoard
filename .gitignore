@@ -1,0 +1,23 @@
+# secrets
+.env
+.njt_token.json
+.njt_token.json.tmp
+
+# data
+*.db
+*.db-wal
+*.db-shm
+njt_gtfs_rail.zip
+dotgov.csv
+njt_raildata_api_v2_extracted.txt
+
+# logs / runtime state 
+*.log
+logger_heartbeat.txt
+
+# python
+__pycache__/
+*.pyc
+
+# scratch 
+_spec.txt

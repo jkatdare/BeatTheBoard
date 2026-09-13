@@ -1,0 +1,519 @@
+"""
+Track prediction engine + local web app for NY Penn Station.
+
+    python engine.py            # serve on http://localhost:8080
+    python engine.py --rebuild  # rebuild both codebooks from collected data first
+    python engine.py --once     # print one board to the terminal and exit
+
+Runtime needs only two things: live API calls and codebook.json. No history
+is consulted to make a prediction, so run_logger.py is optional -- it is one of
+two places --rebuild can learn the codebooks from:
+
+    track_history.db   (run_logger.py)  full vehicle + board dump, ~230 MB/day
+    benchmark.db       (benchmark.py)   board rows + circuit + truth, much smaller
+
+--rebuild reads whichever exist and merges their votes, so the logger can be
+retired without losing what it already taught the codebooks.
+
+How it predicts
+---------------
+Not a model. Two leaked signals in NJ TRANSIT's own RailData API, decoded with
+lookup tables learned from history:
+
+  1. CIRCUIT  getVehicleData -> ICS_TRACK_CKT. The signalling track circuit a
+     train currently occupies. At Penn the circuits belong to Amtrak's A and JO
+     interlockings and name the platform track (AA-A180TK -> 4, JO-AJO16TK -> 6).
+     Appears once the train is routed, well before the board posts.
+  2. BERTH    getTrainSchedule -> GPSLATITUDE/GPSLONGITUDE. A fixed per-track
+     berth coordinate, published before TRACK is. Only exists for tracks
+     1-3 and 10-14.
+
+The two barely overlap, which is why the union is worth so much more than either.
+
+Held-out evaluation (codebooks built on days < 2026-09-08, scored on the rest):
+
+                       coverage   accuracy   median lead
+    circuit              50.1%      99.1%      13.2 min
+    berth                45.8%      98.5%      13.2 min
+    UNION                67.5%      98.6%      13.2 min      flip rate 0.7%
+
+For scale: the official board's own median lead is 9.9 min, and Boxcar Signal
+measured at 50.7% coverage / 98.5% accuracy over the same week.
+
+The engine abstains where neither signal exists. The per-train historical
+prior measured 15.6% (track) / 30.0% (platform) and is shown only as context.
+"""
+
+import argparse
+import json
+import math
+import os
+import sqlite3
+import sys
+import threading
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import njt_logger as njt
+
+HISTORY_DB = njt.DB_PATH          # written by run_logger.py (optional)
+BENCH_DB = "benchmark.db"         # written by benchmark.py
+CODEBOOK_PATH = "codebook.json"
+PORT = int(os.environ.get("PORT", "8080"))
+REFRESH_SECONDS = 30
+
+GPS_MIN_N, GPS_MIN_PURITY = 3, 0.98    # chosen by held-out sweep
+CKT_MIN_N, CKT_MIN_PURITY = 20, 0.95
+
+NYP_LAT, NYP_LON, PENN_BOX = 40.7498, -73.9918, 0.006
+
+
+def _near_penn(lat, lon):
+    try:
+        return (abs(float(lat) - NYP_LAT) < PENN_BOX
+                and abs(float(lon) - NYP_LON) < PENN_BOX)
+    except (TypeError, ValueError):
+        return False
+
+
+def _open_ro(path):
+    """Read-only handle, or None. Never creates a file: sqlite3.connect on a
+    missing path would silently make an empty DB and then fail on the query."""
+    if not path or not os.path.exists(path):
+        return None
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA query_only=1")
+    return conn
+
+
+# ---------------------------------------------------------------- codebooks
+
+def _sift(votes, min_n, min_purity):
+    book, rejected = {}, []
+    for key, counter in votes.items():
+        total = sum(counter.values())
+        if total < min_n:
+            continue
+        track, n = counter.most_common(1)[0]
+        purity = n / total
+        if purity >= min_purity:
+            book[key] = {"track": track, "n": total, "purity": round(purity, 3)}
+        else:
+            rejected.append((key, dict(counter)))
+    return book, rejected
+
+
+def _votes_from_history(gvotes, cvotes):
+    """run_logger.py's DB. Berth votes from posted rows at Penn; circuit votes
+    from every vehicle row of a train-day, against the track it finally posted."""
+    conn = _open_ro(HISTORY_DB)
+    if not conn:
+        return 0
+    n = 0
+    try:
+        for lat, lon, track in conn.execute(
+                "SELECT gps_lat, gps_lon, track FROM observations "
+                "WHERE gps_lat IS NOT NULL AND track != '' AND at_penn = 1"):
+            t = str(track).strip()
+            if t.isdigit():
+                gvotes[lat + "," + lon][t] += 1
+                n += 1
+        for ckt, track in conn.execute(
+                "SELECT v.ics_track_ckt, p.track FROM vehicle_positions v "
+                "JOIN track_postings p ON p.train_id = v.train_id "
+                "                      AND p.service_date = v.service_date "
+                "WHERE v.ics_track_ckt IS NOT NULL AND v.ics_track_ckt != '' "
+                "  AND p.track != ''"):
+            t = str(track).strip()
+            if t.isdigit():
+                cvotes[ckt][t] += 1
+                n += 1
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+    return n
+
+
+def _votes_from_benchmark(gvotes, cvotes):
+    """benchmark.py's DB. Each njt row carries the board item (with GPS) and the
+    circuit the vehicle feed showed for that train at that moment (_circuit).
+    Truth is the first official track for the train-day."""
+    conn = _open_ro(BENCH_DB)
+    if not conn:
+        return 0
+    n = 0
+    try:
+        truth = {}
+        for sd, tid, track in conn.execute(
+                "SELECT service_date, train_id, track FROM obs "
+                "WHERE source = 'njt' AND is_official = 1 AND track IS NOT NULL "
+                "ORDER BY seen_at"):
+            t = str(track).strip()
+            if t.isdigit():
+                truth.setdefault((sd, tid), t)
+        for sd, tid, is_off, raw in conn.execute(
+                "SELECT service_date, train_id, is_official, raw FROM obs "
+                "WHERE source = 'njt'"):
+            t = truth.get((sd, tid))
+            if not t:
+                continue
+            try:
+                item = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            lat, lon = item.get("GPSLATITUDE"), item.get("GPSLONGITUDE")
+            if is_off and lat and lon and _near_penn(lat, lon):
+                gvotes[str(lat) + "," + str(lon)][t] += 1
+                n += 1
+            ckt = item.get("_circuit")
+            if ckt:
+                cvotes[ckt][t] += 1
+                n += 1
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+    return n
+
+
+def build_codebooks(verbose=True):
+    gvotes, cvotes = defaultdict(Counter), defaultdict(Counter)
+    n_hist = _votes_from_history(gvotes, cvotes)
+    n_bench = _votes_from_benchmark(gvotes, cvotes)
+    if not (n_hist or n_bench):
+        sys.exit("No data to learn from: neither %s nor %s has observations yet."
+                 % (HISTORY_DB, BENCH_DB))
+
+    gps, grej = _sift(gvotes, GPS_MIN_N, GPS_MIN_PURITY)
+    cir, crej = _sift(cvotes, CKT_MIN_N, CKT_MIN_PURITY)
+    payload = {"built_at": datetime.now(timezone.utc).isoformat(),
+               "sources": {HISTORY_DB: n_hist, BENCH_DB: n_bench},
+               "gps": gps, "circuits": cir}
+    with open(CODEBOOK_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=1)
+
+    if verbose:
+        print("sources          : %s %d votes | %s %d votes"
+              % (HISTORY_DB, n_hist, BENCH_DB, n_bench))
+        print("berth codebook   : %d coords, tracks %s  (%d ambiguous dropped)"
+              % (len(gps), " ".join(sorted({v["track"] for v in gps.values()}, key=int)), len(grej)))
+        print("circuit codebook : %d circuits, tracks %s  (%d ambiguous dropped)"
+              % (len(cir), " ".join(sorted({v["track"] for v in cir.values()}, key=int)), len(crej)))
+    return payload
+
+
+def load_codebooks(rebuild=False):
+    if rebuild or not os.path.exists(CODEBOOK_PATH):
+        return build_codebooks()
+    with open(CODEBOOK_PATH, "r", encoding="utf-8") as fh:
+        blob = json.load(fh)
+    if "entries" in blob and "gps" not in blob:      # pre-circuit format
+        print("old codebook format found -- rebuilding with circuits")
+        return build_codebooks()
+    print("codebooks: %d berth coords, %d circuits (built %s)"
+          % (len(blob["gps"]), len(blob["circuits"]), blob.get("built_at", "?")[:19]))
+    return blob
+
+
+def load_history():
+    """Per-train track frequencies. Context only -- measured at 15.6% top-1.
+    Reads the logger DB if present, else the benchmark DB, else nothing."""
+    hist = defaultdict(Counter)
+    conn = _open_ro(HISTORY_DB)
+    if conn:
+        try:
+            for train_id, track in conn.execute(
+                    "SELECT train_id, track FROM track_postings WHERE track != ''"):
+                if str(track).strip().isdigit():
+                    hist[train_id][str(track).strip()] += 1
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+    if not hist:
+        conn = _open_ro(BENCH_DB)
+        if conn:
+            try:
+                seen = set()
+                for sd, tid, track in conn.execute(
+                        "SELECT service_date, train_id, track FROM obs "
+                        "WHERE source = 'njt' AND is_official = 1 AND track IS NOT NULL "
+                        "ORDER BY seen_at"):
+                    if (sd, tid) in seen:
+                        continue
+                    seen.add((sd, tid))
+                    if str(track).strip().isdigit():
+                        hist[tid][str(track).strip()] += 1
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+    return hist
+
+
+# ---------------------------------------------------------------- predicting
+
+def platform_of(track):
+    try:
+        t = int(track)
+    except (TypeError, ValueError):
+        return None
+    return math.ceil(t / 2) if t <= 16 else None
+
+
+def where_to_wait(track):
+    p = platform_of(track)
+    if not p:
+        return ""
+    return "Platform %d - head for the Tracks %d-%d stairs" % (p, p * 2 - 1, p * 2)
+
+
+def fetch_circuits(token):
+    """train_id -> current ICS_TRACK_CKT, from one getVehicleData call."""
+    trains = njt.api_post("getVehicleData", {"token": token})
+    if isinstance(trains, dict):
+        trains = trains.get("TRAINS") or []
+    out = {}
+    for t in trains if isinstance(trains, list) else []:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("ID") or t.get("TRAIN_ID") or "").strip()
+        ckt = t.get("ICS_TRACK_CKT")
+        if tid and ckt:
+            out[tid] = ckt
+    return out
+
+
+def predict(item, books, circuits, hist):
+    posted = (item.get("TRACK") or "").strip()
+    if posted:
+        return {"track": posted, "tier": "official", "signal": None,
+                "confidence": None, "note": where_to_wait(posted)}
+
+    tid = str(item.get("TRAIN_ID") or "").strip()
+    ckt = circuits.get(tid)
+    hit = books["circuits"].get(ckt) if ckt else None
+    if hit:
+        return {"track": hit["track"], "tier": "predicted", "signal": "circuit",
+                "confidence": hit["purity"], "note": where_to_wait(hit["track"])}
+
+    lat, lon = item.get("GPSLATITUDE"), item.get("GPSLONGITUDE")
+    if lat and lon:
+        hit = books["gps"].get(str(lat) + "," + str(lon))
+        if hit:
+            return {"track": hit["track"], "tier": "predicted", "signal": "berth",
+                    "confidence": hit["purity"], "note": where_to_wait(hit["track"])}
+
+    counter = hist.get(tid)
+    if counter and sum(counter.values()) >= 4:
+        total = sum(counter.values())
+        top = counter.most_common(3)
+        return {"track": None, "tier": "history", "signal": None,
+                "confidence": round(top[0][1] / total, 2),
+                "candidates": [{"track": t, "share": round(n / total, 2)} for t, n in top],
+                "note": "no live signal - historical tracks only"}
+    return {"track": None, "tier": "none", "signal": None, "confidence": None,
+            "note": "not yet posted"}
+
+
+def build_board(books, hist, token):
+    circuits = fetch_circuits(token)
+    payload = njt.api_post("getTrainSchedule",
+                           {"token": token, "station": njt.STATION})
+    rows = []
+    for item in njt.board_items(payload):
+        p = predict(item, books, circuits, hist)
+        sched = item.get("SCHED_DEP_DATE")
+        try:
+            dep = datetime.strptime(sched, "%d-%b-%Y %I:%M:%S %p")
+            mins = int((dep - datetime.now()).total_seconds() / 60)
+            dep_str = dep.strftime("%I:%M %p").lstrip("0")
+        except (ValueError, TypeError):
+            mins, dep_str = None, sched or ""
+        tid = str(item.get("TRAIN_ID", ""))
+        rows.append({
+            "train": tid,
+            "operator": ("Amtrak" if tid[:1] == "A" else "SEPTA" if tid[:1] == "S"
+                         else "Non-revenue" if tid[:1] == "X" else "NJT"),
+            "line": item.get("LINE", ""),
+            "destination": str(item.get("DESTINATION", "")).replace("&#9992", "✈"),
+            "depart": dep_str,
+            "minutes": mins,
+            "status": item.get("STATUS", ""),
+            "late": item.get("SEC_LATE"),
+            "circuit": circuits.get(tid),
+            "prediction": p,
+        })
+    return {"station": "New York Penn Station",
+            "fetched_at": datetime.now().strftime("%I:%M:%S %p").lstrip("0"),
+            "trains": rows}
+
+
+# -------------------------------------------------------------------- server
+
+STATE = {"board": None, "error": None, "token": None}
+
+
+def refresher(books, hist):
+    while True:
+        try:
+            if not STATE["token"]:
+                STATE["token"] = njt.get_token()
+            STATE["board"] = build_board(books, hist, STATE["token"])
+            STATE["error"] = None
+        except njt.AuthError:
+            STATE["token"] = None
+        except Exception as e:
+            STATE["error"] = type(e).__name__ + ": " + str(e)
+        time.sleep(REFRESH_SECONDS)
+
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Penn Track Engine</title><style>
+:root{--bg:#f7f7f5;--card:#fff;--fg:#1a1a18;--dim:#6b6b66;--line:#e4e4e0;
+--official:#0a7d32;--official-bg:#e8f5ec;--pred:#1257a8;--pred-bg:#e8f0fb;
+--hist:#8a6d1f;--hist-bg:#fbf4e2;--none:#8a8a85;}
+@media(prefers-color-scheme:dark){:root{--bg:#16161a;--card:#1e1e24;--fg:#ececf0;
+--dim:#9a9aa4;--line:#2e2e36;--official:#4ade80;--official-bg:#132a1c;
+--pred:#7cb0f5;--pred-bg:#12233c;--hist:#e0be62;--hist-bg:#2e2712;--none:#71717a;}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+.wrap{max-width:940px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:20px;margin:0 0 2px}.sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+.stats{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;
+padding:8px 12px;font-size:12px}.stat b{display:block;font-size:17px;margin-top:2px}
+table{width:100%;border-collapse:collapse;background:var(--card);
+border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th{text-align:left;font-size:11px;letter-spacing:.05em;text-transform:uppercase;
+color:var(--dim);padding:10px 12px;border-bottom:1px solid var(--line);font-weight:600}
+td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.trk{font-size:19px;font-weight:700;letter-spacing:-.02em}
+.badge{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;
+padding:2px 6px;border-radius:4px;text-transform:uppercase;margin-top:3px;margin-right:4px}
+.b-official{background:var(--official-bg);color:var(--official)}
+.b-predicted{background:var(--pred-bg);color:var(--pred)}
+.b-history{background:var(--hist-bg);color:var(--hist)}
+.b-sig{background:transparent;border:1px solid var(--line);color:var(--dim)}
+.dim{color:var(--dim)}.note{font-size:12px;color:var(--dim);margin-top:3px}
+.dash{color:var(--none);font-size:19px}
+.cand{font-size:12px;color:var(--dim)}
+.op{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.err{background:#fde8e8;color:#9b1c1c;padding:10px 12px;border-radius:8px;margin-bottom:14px}
+footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
+</style></head><body><div class="wrap">
+<h1>NY Penn - Track Engine</h1>
+<div class="sub" id="sub">loading...</div>
+<div class="stats" id="stats"></div>
+<div id="err"></div>
+<table><thead><tr><th>Train</th><th>Destination</th><th>Departs</th><th>Track</th></tr></thead>
+<tbody id="rows"></tbody></table>
+<footer>
+<b>official</b> - posted on the real board &nbsp;|&nbsp;
+<b>predicted</b> - decoded from a live signal: <b>circuit</b> (signalling track circuit)
+or <b>berth</b> (published berth coordinate) &nbsp;|&nbsp;
+<b>history</b> - context only, not a prediction<br>
+Held-out: 67.5% of departures predicted at 98.6% accuracy, median 13 min ahead of the board.
+Always confirm on the station display before boarding.
+</footer></div>
+<script>
+async function tick(){
+  try{
+    const r = await fetch('/api/board'); const d = await r.json();
+    document.getElementById('err').innerHTML = d.error ? '<div class="err">'+d.error+'</div>' : '';
+    if(!d.board){return;}
+    const b = d.board;
+    document.getElementById('sub').textContent = b.station + ' - updated ' + b.fetched_at;
+    let off=0,pred=0,none=0;
+    b.trains.forEach(t=>{const k=t.prediction.tier;
+      if(k==='official')off++; else if(k==='predicted')pred++; else none++;});
+    document.getElementById('stats').innerHTML =
+      '<div class="stat">Trains<b>'+b.trains.length+'</b></div>'+
+      '<div class="stat">On the board<b>'+off+'</b></div>'+
+      '<div class="stat">Predicted early<b>'+pred+'</b></div>'+
+      '<div class="stat">No signal<b>'+none+'</b></div>';
+    document.getElementById('rows').innerHTML = b.trains.map(t=>{
+      const p=t.prediction; let cell;
+      if(p.track){
+        cell='<div class="trk">'+p.track+'</div><span class="badge b-'+p.tier+'">'+
+          p.tier+(p.confidence?' '+Math.round(p.confidence*100)+'%':'')+'</span>'+
+          (p.signal?'<span class="badge b-sig">'+p.signal+'</span>':'')+
+          (p.note?'<div class="note">'+p.note+'</div>':'');
+      } else if(p.tier==='history'){
+        cell='<div class="dash">--</div><span class="badge b-history">history</span>'+
+          '<div class="cand">usually '+p.candidates.map(c=>c.track+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>';
+      } else {
+        cell='<div class="dash">--</div><div class="note">not yet posted</div>';
+      }
+      const mins = t.minutes===null?'':(t.minutes<=0?'<b>now</b>':t.minutes+' min');
+      return '<tr><td><b>'+t.train+'</b><div class="op">'+t.operator+'</div></td>'+
+        '<td>'+t.destination+'<div class="note">'+t.line+'</div></td>'+
+        '<td>'+t.depart+'<div class="note">'+mins+'</div></td>'+
+        '<td>'+cell+'</td></tr>';
+    }).join('');
+  }catch(e){}
+}
+tick(); setInterval(tick, 15000);
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/api/board"):
+            body = json.dumps({"board": STATE["board"], "error": STATE["error"]})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        else:
+            body = PAGE
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+        data = body.encode("utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args()
+
+    njt.load_env()
+    books = load_codebooks(rebuild=args.rebuild)
+    hist = load_history()
+    print("history: %d trains" % len(hist))
+
+    if args.once:
+        board = build_board(books, hist, njt.get_token())
+        print("\n%-7s %-22s %-9s %-7s %-10s %s"
+              % ("TRAIN", "DESTINATION", "DEPARTS", "TRACK", "SOURCE", "CIRCUIT"))
+        print("-" * 76)
+        for t in board["trains"]:
+            p = t["prediction"]
+            src = p["tier"] + ("/" + p["signal"] if p.get("signal") else "")
+            print("%-7s %-22s %-9s %-7s %-10s %s"
+                  % (t["train"], t["destination"][:22], t["depart"],
+                     p["track"] or "--", src, t.get("circuit") or ""))
+        return
+
+    threading.Thread(target=refresher, args=(books, hist), daemon=True).start()
+    print("\nserving http://localhost:%d   (Ctrl-C to stop)" % PORT)
+    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
