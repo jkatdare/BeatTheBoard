@@ -333,12 +333,20 @@ def predict(item, books, circuits, hist):
             "note": "not yet posted"}
 
 
+# NJT train numbers are numeric. Letter prefixes are other operators sharing the
+# board -- A=Amtrak, S=SEPTA, X=non-revenue equipment moves -- none of which a
+# rider here can board, so they are dropped. Set NJT_ONLY=0 to show them again.
+NJT_ONLY = os.environ.get("NJT_ONLY", "1") != "0"
+
+
 def build_board(books, hist, token):
     circuits = fetch_circuits(token)
     payload = njt.api_post("getTrainSchedule",
                            {"token": token, "station": njt.STATION})
     rows = []
     for item in njt.board_items(payload):
+        if NJT_ONLY and not str(item.get("TRAIN_ID", "")).strip().isdigit():
+            continue
         p = predict(item, books, circuits, hist)
         sched = item.get("SCHED_DEP_DATE")
         try:

@@ -1,47 +1,68 @@
 """
-Lightweight accuracy check: our predictions vs the real posted track.
+Score the DEPLOYED app against the real board.
 
-    python check.py            # run; prints a line per poll and each result as it resolves
-    python check.py --report   # scorecard from what has been collected
+    python check.py                 # poll the web app every 30s, record outcomes
+    python check.py --report        # scorecard
+    python check.py --every 240     # poll every 4 min instead (lets the app sleep)
 
-What it does, and nothing more:
-  * every 30s, two API calls (vehicle feed + NY board) -- same as the engine
-  * remembers the FIRST prediction we made for each train-day, and when
-  * when the board posts the real track, compares and records the outcome
-  * one small row per train-day in check.db; no raw JSON, no Boxcar, no dumps
+What it measures
+  1. Are the predictions right?  For each train, the first prediction the app
+     showed is remembered; when the board posts the real track, it is scored.
+  2. How much of the board are we predicting?  Every poll records how many
+     trains were official / predicted / unpredicted, so the report can say
+     "of the trains not yet posted, X% had a prediction" -- overall and by hour.
+  3. Is the app healthy?  API errors and cold-start latency are logged too.
 
-Prediction logic is imported from engine.py, so this scores exactly what the
-web app shows. Codebook is frozen at startup (run engine.py --rebuild to refresh).
+This reads only https://<app>/api/board. No NJT credentials needed, so it can
+run from any machine. One row per train-day plus one per poll in check.db.
+
+Cost note: while this polls every 30s the container never idles, so it never
+scales to zero. That is fine for a test window; for weeks at a time use
+--every 240 or more, at the price of coarser lead-time measurement.
 """
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 
-import njt_logger as njt
-import engine
-
+APP_URL = os.environ.get(
+    "BOARD_URL",
+    "https://beattheboard.thankfulpond-632cee48.eastus2.azurecontainerapps.io").rstrip("/")
 DB = "check.db"
-POLL = 30
+SERVICE_DAY_CUTOFF_HOUR = 3        # trains after midnight belong to the prior day
 
 DDL = """
 CREATE TABLE IF NOT EXISTS results (
     service_date TEXT NOT NULL,
     train_id     TEXT NOT NULL,
+    operator     TEXT,
     line         TEXT,
     destination  TEXT,
     sched_dep    TEXT,
-    predicted    TEXT,        -- our first prediction (NULL = we never predicted)
-    signal       TEXT,        -- circuit | berth
+    predicted    TEXT,          -- first prediction shown (NULL = never predicted)
+    signal       TEXT,          -- circuit | berth
     confidence   REAL,
-    predicted_at TEXT,        -- UTC ISO
-    flipped      INTEGER DEFAULT 0,   -- a later prediction disagreed before posting
-    actual       TEXT,        -- official track (NULL = not posted yet)
+    predicted_at TEXT,          -- UTC ISO
+    flipped      INTEGER DEFAULT 0,
+    actual       TEXT,          -- official track (NULL = not posted yet)
     posted_at    TEXT,
     PRIMARY KEY (service_date, train_id)
+);
+CREATE TABLE IF NOT EXISTS polls (
+    seen_at      TEXT NOT NULL,
+    n_trains     INTEGER,
+    n_official   INTEGER,
+    n_predicted  INTEGER,
+    n_unposted   INTEGER,       -- on the board, no official track, no prediction
+    api_error    TEXT,
+    age          INTEGER,       -- seconds since the app last fetched from NJT
+    latency_ms   INTEGER
 );
 """
 
@@ -50,11 +71,32 @@ def connect():
     conn = sqlite3.connect(DB)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(DDL)
+    # A check.db left by the earlier credential-based checker lacks this
+    # column, and CREATE TABLE IF NOT EXISTS will not add it.
+    try:
+        conn.execute("ALTER TABLE results ADD COLUMN operator TEXT")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
 def say(msg):
     print(msg, flush=True)
+
+
+def local_now():
+    """Eastern time if the tz database is available, else the machine clock."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now()
+
+
+def service_date(dt):
+    if dt.hour < SERVICE_DAY_CUTOFF_HOUR:
+        dt = dt - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
 
 
 def minutes(a, b):
@@ -64,48 +106,62 @@ def minutes(a, b):
         return None
 
 
+def fetch_board():
+    req = urllib.request.Request(APP_URL + "/api/board",
+                                 headers={"User-Agent": "beattheboard-check/2.0"})
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=90) as resp:      # 90s: cold start
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    return data, int((time.time() - t0) * 1000)
+
+
 # ------------------------------------------------------------------ collect
 
-def poll(conn, token, books):
-    circuits = engine.fetch_circuits(token)
-    payload = njt.api_post("getTrainSchedule", {"token": token, "station": njt.STATION})
+def poll(conn):
+    data, latency = fetch_board()
     now = datetime.now(timezone.utc).isoformat()
-    svc = njt.service_date_for(datetime.now())
-    resolved = []
+    svc = service_date(local_now())
+    board, err = data.get("board"), data.get("error")
+    trains = board["trains"] if board else []
 
-    for item in njt.board_items(payload):
-        tid = str(item.get("TRAIN_ID") or "").strip()
+    n_off = sum(1 for t in trains if t["prediction"]["tier"] == "official")
+    n_pred = sum(1 for t in trains if t["prediction"]["tier"] == "predicted")
+    n_unp = len(trains) - n_off - n_pred
+    conn.execute("INSERT INTO polls VALUES (?,?,?,?,?,?,?,?)",
+                 (now, len(trains), n_off, n_pred, n_unp, err, data.get("age"), latency))
+
+    resolved = []
+    for t in trains:
+        tid = str(t.get("train") or "").strip()
+        p = t.get("prediction") or {}
         if not tid:
             continue
-        p = engine.predict(item, books, circuits, {})
         row = conn.execute("SELECT predicted, actual FROM results "
                            "WHERE service_date=? AND train_id=?", (svc, tid)).fetchone()
+        meta = (t.get("operator"), t.get("line"), t.get("destination"), t.get("depart"))
 
-        if p["tier"] == "official":
+        if p.get("tier") == "official":
             if row is None:
-                # never predicted; still counts in the denominator
-                conn.execute("INSERT INTO results (service_date, train_id, line, destination, "
-                             "sched_dep, actual, posted_at) VALUES (?,?,?,?,?,?,?)",
-                             (svc, tid, item.get("LINE"), item.get("DESTINATION"),
-                              item.get("SCHED_DEP_DATE"), p["track"], now))
+                conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
+                             "destination, sched_dep, actual, posted_at) VALUES (?,?,?,?,?,?,?,?)",
+                             (svc, tid) + meta + (p["track"], now))
             elif row[1] is None:
                 conn.execute("UPDATE results SET actual=?, posted_at=? "
                              "WHERE service_date=? AND train_id=?", (p["track"], now, svc, tid))
                 if row[0]:
                     resolved.append((tid, row[0], p["track"]))
 
-        elif p["tier"] == "predicted":
+        elif p.get("tier") == "predicted":
             if row is None:
-                conn.execute("INSERT INTO results (service_date, train_id, line, destination, "
-                             "sched_dep, predicted, signal, confidence, predicted_at) "
-                             "VALUES (?,?,?,?,?,?,?,?,?)",
-                             (svc, tid, item.get("LINE"), item.get("DESTINATION"),
-                              item.get("SCHED_DEP_DATE"), p["track"], p["signal"],
-                              p["confidence"], now))
+                conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
+                             "destination, sched_dep, predicted, signal, confidence, predicted_at) "
+                             "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             (svc, tid) + meta + (p["track"], p.get("signal"),
+                                                  p.get("confidence"), now))
             elif row[0] is None and row[1] is None:
                 conn.execute("UPDATE results SET predicted=?, signal=?, confidence=?, "
                              "predicted_at=? WHERE service_date=? AND train_id=?",
-                             (p["track"], p["signal"], p["confidence"], now, svc, tid))
+                             (p["track"], p.get("signal"), p.get("confidence"), now, svc, tid))
             elif row[0] and row[1] is None and row[0] != p["track"]:
                 conn.execute("UPDATE results SET flipped=1 "
                              "WHERE service_date=? AND train_id=?", (svc, tid))
@@ -114,11 +170,12 @@ def poll(conn, token, books):
     for tid, pred, actual in resolved:
         r = conn.execute("SELECT signal, predicted_at, posted_at FROM results "
                          "WHERE service_date=? AND train_id=?", (svc, tid)).fetchone()
-        lead = minutes(r[1], r[2])
-        say("   %s  %-6s predicted %-3s actual %-3s %s  (%s, %.1f min early)"
+        lead = minutes(r[1], r[2]) or 0
+        say("   %s  %-6s predicted %-3s actual %-3s %s (%s, %.1f min early)"
             % ("HIT " if pred == actual else "MISS", tid, pred, actual,
-               "" if pred == actual else "<--", r[0], lead if lead is not None else 0))
-    return len(resolved)
+               "   " if pred == actual else "<--", r[0], lead))
+
+    return len(trains), n_off, n_pred, n_unp, err, latency
 
 
 def scoreline(conn):
@@ -127,39 +184,30 @@ def scoreline(conn):
                           "AND predicted IS NOT NULL").fetchone()[0]
     n_hit = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NOT NULL "
                          "AND predicted = actual").fetchone()[0]
-    pending = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NULL "
-                           "AND predicted IS NOT NULL").fetchone()[0]
     cov = 100.0 * n_pred / n_res if n_res else 0
     acc = 100.0 * n_hit / n_pred if n_pred else 0
-    return "resolved %d | predicted %d (%.0f%%) | correct %d (%.1f%%) | pending %d" % (
-        n_res, n_pred, cov, n_hit, acc, pending)
+    return "resolved %d | predicted %d (%.0f%%) | correct %.1f%%" % (n_res, n_pred, cov, acc)
 
 
-def collect():
-    njt.load_env()
-    books = engine.load_codebooks()
+def collect(every):
     conn = connect()
-    token = njt.get_token()
-    say("checking every %ds -> %s   (Ctrl-C to stop)\n" % (POLL, DB))
+    say("checking %s every %ds -> %s   (Ctrl-C to stop)\n" % (APP_URL, every, DB))
     errors = 0
     while True:
         try:
-            poll(conn, token, books)
-            say("[%s] %s" % (datetime.now().strftime("%H:%M:%S"), scoreline(conn)))
+            n, off, pred, unp, err, ms = poll(conn)
+            board = "board %2d: %2d official, %2d predicted, %2d unpredicted" % (n, off, pred, unp)
+            say("[%s] %s | %4dms%s | %s"
+                % (datetime.now().strftime("%H:%M:%S"), board, ms,
+                   "  APP ERROR: " + err if err else "", scoreline(conn)))
             errors = 0
-            time.sleep(POLL)
-        except njt.AuthError:
-            say("   re-minting token")
-            try:
-                token = njt.get_token(force=True)
-            except Exception as e:
-                errors += 1
-                say("   re-auth failed: %s" % e)
-                time.sleep(POLL * min(2 ** errors, 20))
+            time.sleep(every)
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             errors += 1
-            say("   error: %s: %s" % (type(e).__name__, e))
-            time.sleep(POLL * min(2 ** errors, 20))
+            say("   fetch failed: %s: %s" % (type(e).__name__, e))
+            time.sleep(min(every * 2 ** errors, 600))
 
 
 # ------------------------------------------------------------------- report
@@ -168,49 +216,79 @@ def report():
     if not os.path.exists(DB):
         sys.exit("No %s yet. Run  python check.py  first." % DB)
     conn = connect()
-    rows = conn.execute("SELECT service_date, train_id, line, predicted, signal, "
+
+    # ---- 1. accuracy on resolved train-days
+    rows = conn.execute("SELECT service_date, train_id, operator, line, predicted, signal, "
                         "predicted_at, actual, posted_at, flipped FROM results "
                         "WHERE actual IS NOT NULL ORDER BY posted_at").fetchall()
+    print("=" * 68)
     if not rows:
-        sys.exit("Nothing resolved yet.")
-    days = sorted({r[0] for r in rows})
-    pred = [r for r in rows if r[3]]
-    hits = [r for r in pred if r[3] == r[6]]
-    miss = [r for r in pred if r[3] != r[6]]
-    leads = sorted(x for x in (minutes(r[5], r[7]) for r in pred) if x is not None)
+        print("Nothing resolved yet -- no train has posted since checking began.")
+    else:
+        days = sorted({r[0] for r in rows})
+        pred = [r for r in rows if r[4]]
+        hits = [r for r in pred if r[4] == r[7]]
+        miss = [r for r in pred if r[4] != r[7]]
+        leads = sorted(x for x in (minutes(r[6], r[8]) for r in pred) if x is not None and x > -1)
+        print("ARE THE PREDICTIONS RIGHT?   %d train-days, %s .. %s" % (len(rows), days[0], days[-1]))
+        print("=" * 68)
+        print("coverage   %5.1f%%   (%d of %d departures had a prediction before posting)"
+              % (100.0 * len(pred) / len(rows), len(pred), len(rows)))
+        print("accuracy   %5.1f%%   (%d right, %d wrong)"
+              % (100.0 * len(hits) / max(len(pred), 1), len(hits), len(miss)))
+        print("flips      %5.1f%%   (%d changed before posting)"
+              % (100.0 * sum(1 for r in pred if r[9]) / max(len(pred), 1), sum(1 for r in pred if r[9])))
+        if leads:
+            print("lead       median %.1f min   p25 %.1f   p75 %.1f   max %.0f"
+                  % (leads[len(leads) // 2], leads[len(leads) // 4], leads[3 * len(leads) // 4], leads[-1]))
+        print("\nby signal:")
+        for sig in ("circuit", "berth"):
+            s = [r for r in pred if r[5] == sig]
+            if s:
+                print("   %-8s %4d   %5.1f%% accurate"
+                      % (sig, len(s), 100.0 * sum(1 for r in s if r[4] == r[7]) / len(s)))
+        print("\nby track (share of departures on that track we predicted):")
+        used, got = Counter(r[7] for r in rows), Counter(r[7] for r in pred)
+        for t in sorted(used, key=lambda x: int(x) if str(x).isdigit() else 99):
+            print("   track %-3s %3d/%-3d %4.0f%%" % (t, got[t], used[t], 100.0 * got[t] / used[t]))
+        if miss:
+            print("\nmisses:")
+            for r in miss:
+                print("   %s  %-6s %-18s predicted %-3s actual %-3s (%s)"
+                      % (r[0], r[1], (r[3] or "")[:18], r[4], r[7], r[5]))
 
-    print("=" * 66)
-    print("PREDICTIONS vs REAL TRACKS  --  %d train-days, %s .. %s" % (len(rows), days[0], days[-1]))
-    print("=" * 66)
-    print("coverage   %5.1f%%   (%d of %d departures got a prediction)"
-          % (100.0 * len(pred) / len(rows), len(pred), len(rows)))
-    print("accuracy   %5.1f%%   (%d right, %d wrong)"
-          % (100.0 * len(hits) / max(len(pred), 1), len(hits), len(miss)))
-    print("flips      %5.1f%%   (%d changed before posting)"
-          % (100.0 * sum(1 for r in pred if r[8]) / max(len(pred), 1), sum(1 for r in pred if r[8])))
-    if leads:
-        print("lead       median %.1f min   p25 %.1f   p75 %.1f   max %.0f"
-              % (leads[len(leads) // 2], leads[len(leads) // 4], leads[3 * len(leads) // 4], leads[-1]))
-
-    print("\nby signal:")
-    for sig in ("circuit", "berth"):
-        s = [r for r in pred if r[4] == sig]
-        if s:
-            print("   %-8s %4d predictions   %5.1f%% accurate"
-                  % (sig, len(s), 100.0 * sum(1 for r in s if r[3] == r[6]) / len(s)))
-
-    print("\nby track (coverage of departures that actually used it):")
-    from collections import Counter
-    used, got = Counter(r[6] for r in rows), Counter(r[6] for r in pred)
-    for t in sorted(used, key=lambda x: int(x) if x.isdigit() else 99):
-        print("   track %-3s %3d/%-3d %4.0f%%" % (t, got[t], used[t], 100.0 * got[t] / used[t]))
-
-    if miss:
-        print("\nmisses:")
-        for r in miss:
-            print("   %s  %-6s %-18s predicted %-3s actual %-3s (%s)"
-                  % (r[0], r[1], (r[2] or "")[:18], r[3], r[6], r[4]))
-    print("=" * 66)
+    # ---- 2. how much of the board are we predicting, live
+    polls = conn.execute("SELECT seen_at, n_trains, n_official, n_predicted, n_unposted, "
+                         "api_error, latency_ms FROM polls ORDER BY seen_at").fetchall()
+    print("\n" + "=" * 68)
+    print("HOW MUCH OF THE BOARD ARE WE PREDICTING?   %d polls" % len(polls))
+    print("=" * 68)
+    if polls:
+        open_polls = [p for p in polls if (p[3] + p[4]) > 0]
+        tot_pred = sum(p[3] for p in open_polls)
+        tot_open = sum(p[3] + p[4] for p in open_polls)
+        print("of trains NOT yet posted, had a prediction : %5.1f%%   (%d of %d train-polls)"
+              % (100.0 * tot_pred / max(tot_open, 1), tot_pred, tot_open))
+        print("average board: %.1f trains = %.1f official + %.1f predicted + %.1f unpredicted"
+              % tuple(sum(p[i] for p in polls) / len(polls) for i in (1, 2, 3, 4)))
+        by_hour = {}
+        for p in polls:
+            try:
+                h = datetime.fromisoformat(p[0]).astimezone().hour
+            except ValueError:
+                continue
+            b = by_hour.setdefault(h, [0, 0])
+            b[0] += p[3]
+            b[1] += p[3] + p[4]
+        print("\nby local hour (share of unposted trains with a prediction):")
+        for h in sorted(by_hour):
+            if by_hour[h][1]:
+                print("   %02d:00  %5.1f%%  (%d)" % (h, 100.0 * by_hour[h][0] / by_hour[h][1], by_hour[h][1]))
+        errs = sum(1 for p in polls if p[5])
+        lat = sorted(p[6] for p in polls if p[6] is not None)
+        print("\napp health: %d/%d polls returned an error; latency median %d ms, max %d ms"
+              % (errs, len(polls), lat[len(lat) // 2] if lat else 0, lat[-1] if lat else 0))
+    print("=" * 68)
 
 
 def main():
@@ -220,12 +298,13 @@ def main():
         pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--every", type=int, default=30, help="seconds between polls (default 30)")
     args = ap.parse_args()
     if args.report:
         report()
     else:
         try:
-            collect()
+            collect(args.every)
         except KeyboardInterrupt:
             say("\nstopped -- run  python check.py --report")
 
