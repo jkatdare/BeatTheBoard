@@ -362,6 +362,38 @@ def predict(item, books, circuits, hist):
 NJT_ONLY = os.environ.get("NJT_ONLY", "1") != "0"
 
 
+# What the app told people earlier today, so that when NJ Transit posts the
+# track it can say whether the prediction held. In-process only: it resets when
+# the container restarts (scale-to-zero), after which already-posted trains just
+# show as official until the next prediction is made.
+MEMO = {}
+
+
+def service_date_eastern():
+    d = now_eastern()
+    if d.hour < 3:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+def remember(tid, p):
+    """Record first predictions; turn a matching official posting into
+    'verified' (100%), or flag the earlier prediction on a miss."""
+    key = (service_date_eastern(), tid)
+    if p["tier"] == "predicted":
+        MEMO.setdefault(key, p["track"])
+    elif p["tier"] == "official" and key in MEMO:
+        if MEMO[key] == p["track"]:
+            p["tier"] = "verified"
+            p["confidence"] = 1.0
+        else:
+            p["missed"] = MEMO[key]
+    if len(MEMO) > 1500:                      # keep today and yesterday only
+        keep = {key[0], (now_eastern() - timedelta(days=1)).strftime("%Y-%m-%d")}
+        for k in [k for k in MEMO if k[0] not in keep]:
+            del MEMO[k]
+
+
 def build_board(books, hist, token):
     circuits = fetch_circuits(token)
     payload = njt.api_post("getTrainSchedule",
@@ -371,6 +403,7 @@ def build_board(books, hist, token):
         if NJT_ONLY and not str(item.get("TRAIN_ID", "")).strip().isdigit():
             continue
         p = predict(item, books, circuits, hist)
+        remember(str(item.get("TRAIN_ID", "")).strip(), p)
         sched = item.get("SCHED_DEP_DATE")
         try:
             dep = datetime.strptime(sched, "%d-%b-%Y %I:%M:%S %p")
@@ -484,6 +517,8 @@ padding:2px 6px;border-radius:4px;text-transform:uppercase;margin-top:3px;margin
 .b-official{background:var(--official-bg);color:var(--official)}
 .b-predicted{background:var(--pred-bg);color:var(--pred)}
 .b-history{background:var(--hist-bg);color:var(--hist)}
+.b-verified{background:var(--official-bg);color:var(--official)}
+.miss{font-size:12px;color:var(--hist);margin-top:3px}
 .dim{color:var(--dim)}.note{font-size:12px;color:var(--dim);margin-top:3px}
 .dash{color:var(--none);font-size:19px}
 .cand{font-size:12px;color:var(--dim)}
@@ -499,6 +534,7 @@ footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
 <tbody id="rows"></tbody></table>
 <footer>
 <b>official</b> - posted on the real board &nbsp;|&nbsp;
+<b>verified</b> - predicted earlier, then confirmed when NJ Transit posted it &nbsp;|&nbsp;
 <b>predicted</b> - decoded from live train position data, before the board posts &nbsp;|&nbsp;
 <b>history</b> - context only, not a prediction<br>
 Held-out: 67.5% of departures predicted at 98.6% accuracy, median 13 min ahead of the board.
@@ -512,20 +548,23 @@ async function tick(){
     if(!d.board){return;}
     const b = d.board;
     document.getElementById('sub').textContent = b.station + ' - updated ' + b.fetched_at;
-    let off=0,pred=0,none=0;
+    let off=0,pred=0,ver=0,none=0;
     b.trains.forEach(t=>{const k=t.prediction.tier;
-      if(k==='official')off++; else if(k==='predicted')pred++; else none++;});
+      if(k==='official'||k==='verified'){off++; if(k==='verified')ver++;}
+      else if(k==='predicted')pred++; else none++;});
     document.getElementById('stats').innerHTML =
       '<div class="stat">Trains<b>'+b.trains.length+'</b></div>'+
       '<div class="stat">On the board<b>'+off+'</b></div>'+
       '<div class="stat">Predicted early<b>'+pred+'</b></div>'+
+      '<div class="stat">Verified<b>'+ver+'</b></div>'+
       '<div class="stat">No signal<b>'+none+'</b></div>';
     document.getElementById('rows').innerHTML = b.trains.map(t=>{
       const p=t.prediction; let cell;
       if(p.track){
         cell='<div class="trk">'+p.track+'</div><span class="badge b-'+p.tier+'">'+
           p.tier+(p.confidence?' '+Math.round(p.confidence*100)+'%':'')+'</span>'+
-          (p.note?'<div class="note">'+p.note+'</div>':'');
+          (p.note?'<div class="note">'+p.note+'</div>':'')+
+          (p.missed?'<div class="miss">we predicted '+p.missed+' - that was wrong</div>':'');
       } else if(p.tier==='history'){
         cell='<div class="dash">--</div><span class="badge b-history">history</span>'+
           '<div class="cand">usually '+p.candidates.map(c=>c.track+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>';

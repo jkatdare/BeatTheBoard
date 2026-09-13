@@ -124,7 +124,7 @@ def poll(conn):
     board, err = data.get("board"), data.get("error")
     trains = board["trains"] if board else []
 
-    n_off = sum(1 for t in trains if t["prediction"]["tier"] == "official")
+    n_off = sum(1 for t in trains if t["prediction"]["tier"] in ("official", "verified"))
     n_pred = sum(1 for t in trains if t["prediction"]["tier"] == "predicted")
     n_unp = len(trains) - n_off - n_pred
     conn.execute("INSERT INTO polls VALUES (?,?,?,?,?,?,?,?)",
@@ -140,7 +140,7 @@ def poll(conn):
                            "WHERE service_date=? AND train_id=?", (svc, tid)).fetchone()
         meta = (t.get("operator"), t.get("line"), t.get("destination"), t.get("depart"))
 
-        if p.get("tier") == "official":
+        if p.get("tier") in ("official", "verified"):   # both are NJT's posted track
             if row is None:
                 conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
                              "destination, sched_dep, actual, posted_at) VALUES (?,?,?,?,?,?,?,?)",
