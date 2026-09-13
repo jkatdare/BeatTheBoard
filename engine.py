@@ -65,7 +65,7 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import njt_logger as njt
@@ -279,10 +279,33 @@ def platform_of(track):
 
 
 def where_to_wait(track):
+    """Tracks share an island in pairs (9 and 10 are one platform), so the
+    useful direction is which staircase -- not a platform number, which
+    confuses people when it does not match the track number."""
     p = platform_of(track)
     if not p:
         return ""
-    return "Platform %d - head for the Tracks %d-%d stairs" % (p, p * 2 - 1, p * 2)
+    return "Head for the Tracks %d-%d stairs" % (p * 2 - 1, p * 2)
+
+
+def now_eastern():
+    """NJT times are US Eastern; the container clock is UTC. Prefer the tz
+    database when present, else apply the US DST rule by hand (python:*-slim
+    images ship without tzdata)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    except Exception:
+        utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        def nth_sunday(month, n):
+            d = datetime(utc.year, month, 1)
+            d += timedelta(days=(6 - d.weekday()) % 7)      # first Sunday
+            return d + timedelta(weeks=n - 1)
+
+        dst_start = nth_sunday(3, 2) + timedelta(hours=7)   # 2am EST = 07:00 UTC
+        dst_end = nth_sunday(11, 1) + timedelta(hours=6)    # 2am EDT = 06:00 UTC
+        return utc - timedelta(hours=4 if dst_start <= utc < dst_end else 5)
 
 
 def fetch_circuits(token):
@@ -351,7 +374,7 @@ def build_board(books, hist, token):
         sched = item.get("SCHED_DEP_DATE")
         try:
             dep = datetime.strptime(sched, "%d-%b-%Y %I:%M:%S %p")
-            mins = int((dep - datetime.now()).total_seconds() / 60)
+            mins = int((dep - now_eastern()).total_seconds() / 60)
             dep_str = dep.strftime("%I:%M %p").lstrip("0")
         except (ValueError, TypeError):
             mins, dep_str = None, sched or ""
@@ -370,7 +393,7 @@ def build_board(books, hist, token):
             "prediction": p,
         })
     return {"station": "New York Penn Station",
-            "fetched_at": datetime.now().strftime("%I:%M:%S %p").lstrip("0"),
+            "fetched_at": now_eastern().strftime("%I:%M:%S %p").lstrip("0"),
             "trains": rows}
 
 
@@ -461,7 +484,6 @@ padding:2px 6px;border-radius:4px;text-transform:uppercase;margin-top:3px;margin
 .b-official{background:var(--official-bg);color:var(--official)}
 .b-predicted{background:var(--pred-bg);color:var(--pred)}
 .b-history{background:var(--hist-bg);color:var(--hist)}
-.b-sig{background:transparent;border:1px solid var(--line);color:var(--dim)}
 .dim{color:var(--dim)}.note{font-size:12px;color:var(--dim);margin-top:3px}
 .dash{color:var(--none);font-size:19px}
 .cand{font-size:12px;color:var(--dim)}
@@ -477,8 +499,7 @@ footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
 <tbody id="rows"></tbody></table>
 <footer>
 <b>official</b> - posted on the real board &nbsp;|&nbsp;
-<b>predicted</b> - decoded from a live signal: <b>circuit</b> (signalling track circuit)
-or <b>berth</b> (published berth coordinate) &nbsp;|&nbsp;
+<b>predicted</b> - decoded from live train position data, before the board posts &nbsp;|&nbsp;
 <b>history</b> - context only, not a prediction<br>
 Held-out: 67.5% of departures predicted at 98.6% accuracy, median 13 min ahead of the board.
 Always confirm on the station display before boarding.
@@ -504,7 +525,6 @@ async function tick(){
       if(p.track){
         cell='<div class="trk">'+p.track+'</div><span class="badge b-'+p.tier+'">'+
           p.tier+(p.confidence?' '+Math.round(p.confidence*100)+'%':'')+'</span>'+
-          (p.signal?'<span class="badge b-sig">'+p.signal+'</span>':'')+
           (p.note?'<div class="note">'+p.note+'</div>':'');
       } else if(p.tier==='history'){
         cell='<div class="dash">--</div><span class="badge b-history">history</span>'+
