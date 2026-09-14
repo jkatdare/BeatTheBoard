@@ -533,12 +533,11 @@ footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
 <table><thead><tr><th>Train</th><th>Destination</th><th>Departs</th><th>Track</th></tr></thead>
 <tbody id="rows"></tbody></table>
 <footer>
-<b>official</b> - posted on the real board &nbsp;|&nbsp;
-<b>verified</b> - predicted earlier, then confirmed when NJ Transit posted it &nbsp;|&nbsp;
-<b>predicted</b> - decoded from live train position data, before the board posts &nbsp;|&nbsp;
-<b>history</b> - context only, not a prediction<br>
-Held-out: 67.5% of departures predicted at 98.6% accuracy, median 13 min ahead of the board.
-Always confirm on the station display before boarding.
+<div><b>predicted</b> (blue, with a percentage) - we have made a call; NJ Transit has not posted the track yet, so nothing has confirmed or denied it.</div>
+<div><b>verified</b> (green, 100%) - we predicted it, then NJ Transit posted the same track. Prediction confirmed.</div>
+<div><b>official</b> (green, no percentage) - NJ Transit has posted the track and we have no confirmed prediction to show for it. That is two cases: we never predicted this train (no signal), or we predicted it wrong - in which case an amber line underneath says "we predicted 12 - that was wrong."</div>
+<div><b>history</b> - what this train number has done on past days. Context only, not a prediction.</div>
+<div>Always confirm on the station display before boarding.</div>
 </footer></div>
 <script>
 async function tick(){

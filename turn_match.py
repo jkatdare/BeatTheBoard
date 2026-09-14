@@ -37,7 +37,13 @@ import sys
 import zipfile
 from collections import Counter, defaultdict
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# reconfigure in place rather than wrapping: a fresh TextIOWrapper closes the
+# shared buffer when it is garbage-collected, which kills stdout for any
+# script that imports this module.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
 
 GTFS_ZIP = "njt_gtfs_rail.zip"
 DB = "track_history.db"
