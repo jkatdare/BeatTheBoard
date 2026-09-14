@@ -308,8 +308,8 @@ def now_eastern():
         return utc - timedelta(hours=4 if dst_start <= utc < dst_end else 5)
 
 
-def fetch_circuits(token):
-    """train_id -> current ICS_TRACK_CKT, from one getVehicleData call."""
+def fetch_vehicles(token):
+    """train_id -> {ckt, lat, lon, next_stop}, from one getVehicleData call."""
     trains = njt.api_post("getVehicleData", {"token": token})
     if isinstance(trains, dict):
         trains = trains.get("TRAINS") or []
@@ -318,10 +318,35 @@ def fetch_circuits(token):
         if not isinstance(t, dict):
             continue
         tid = str(t.get("ID") or t.get("TRAIN_ID") or "").strip()
-        ckt = t.get("ICS_TRACK_CKT")
-        if tid and ckt:
-            out[tid] = ckt
+        if tid:
+            out[tid] = {"ckt": t.get("ICS_TRACK_CKT") or None,
+                        "lat": t.get("LATITUDE"), "lon": t.get("LONGITUDE"),
+                        "next_stop": t.get("NEXT_STOP")}
     return out
+
+
+def fetch_circuits(token):
+    """train_id -> current ICS_TRACK_CKT (the form benchmark.py relies on)."""
+    return {tid: v["ckt"] for tid, v in fetch_vehicles(token).items() if v["ckt"]}
+
+
+def arrival(item, vehicle):
+    """Is this train physically at Penn?  -> (True / False / None, label)
+    BOARDING on the board is definitive. Otherwise the vehicle feed's reported
+    position; failing that, the board row's own coordinate. None = the train
+    is not reporting a position at all (not yet activated, or sitting under
+    its inbound number after a turn)."""
+    status = str(item.get("STATUS") or "").strip().upper()
+    if status in ("BOARDING", "ALL ABOARD"):
+        return True, "arrived"
+    lat = lon = None
+    if vehicle and vehicle.get("lat") and vehicle.get("lon"):
+        lat, lon = vehicle["lat"], vehicle["lon"]
+    elif item.get("GPSLATITUDE") and item.get("GPSLONGITUDE"):
+        lat, lon = item["GPSLATITUDE"], item["GPSLONGITUDE"]
+    if lat is None:
+        return None, "no position"
+    return (True, "arrived") if _near_penn(lat, lon) else (False, "en route")
 
 
 def predict(item, books, circuits, hist):
@@ -395,7 +420,8 @@ def remember(tid, p):
 
 
 def build_board(books, hist, token):
-    circuits = fetch_circuits(token)
+    vehicles = fetch_vehicles(token)
+    circuits = {tid: v["ckt"] for tid, v in vehicles.items() if v["ckt"]}
     payload = njt.api_post("getTrainSchedule",
                            {"token": token, "station": njt.STATION})
     rows = []
@@ -403,7 +429,9 @@ def build_board(books, hist, token):
         if NJT_ONLY and not str(item.get("TRAIN_ID", "")).strip().isdigit():
             continue
         p = predict(item, books, circuits, hist)
-        remember(str(item.get("TRAIN_ID", "")).strip(), p)
+        tid0 = str(item.get("TRAIN_ID", "")).strip()
+        remember(tid0, p)
+        arrived, at = arrival(item, vehicles.get(tid0))
         sched = item.get("SCHED_DEP_DATE")
         try:
             dep = datetime.strptime(sched, "%d-%b-%Y %I:%M:%S %p")
@@ -423,6 +451,8 @@ def build_board(books, hist, token):
             "status": item.get("STATUS", ""),
             "late": item.get("SEC_LATE"),
             "circuit": circuits.get(tid),
+            "arrived": arrived,
+            "at": at,
             "prediction": p,
         })
     return {"station": "New York Penn Station",
@@ -518,6 +548,9 @@ padding:2px 6px;border-radius:4px;text-transform:uppercase;margin-top:3px;margin
 .b-predicted{background:var(--pred-bg);color:var(--pred)}
 .b-history{background:var(--hist-bg);color:var(--hist)}
 .b-verified{background:var(--official-bg);color:var(--official)}
+.pill{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;padding:3px 8px;border-radius:4px;text-transform:uppercase;white-space:nowrap;margin-top:2px}
+.p-on{background:var(--official-bg);color:var(--official)}
+.p-off{background:var(--line);color:var(--dim)}
 .miss{font-size:12px;color:var(--hist);margin-top:3px}
 .dim{color:var(--dim)}.note{font-size:12px;color:var(--dim);margin-top:3px}
 .dash{color:var(--none);font-size:19px}
@@ -530,7 +563,7 @@ footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
 <div class="sub" id="sub">loading...</div>
 <div class="stats" id="stats"></div>
 <div id="err"></div>
-<table><thead><tr><th>Train</th><th>Destination</th><th>Departs</th><th>Track</th></tr></thead>
+<table><thead><tr><th>Train</th><th>Destination</th><th>Departs</th><th>Track</th><th>Arrived</th></tr></thead>
 <tbody id="rows"></tbody></table>
 <footer>
 <div><b>predicted</b> (blue, with a percentage) - we have made a call; NJ Transit has not posted the track yet, so nothing has confirmed or denied it.</div>
@@ -574,7 +607,8 @@ async function tick(){
       return '<tr><td><b>'+t.train+'</b><div class="op">'+t.operator+'</div></td>'+
         '<td>'+t.destination+'<div class="note">'+t.line+'</div></td>'+
         '<td>'+t.depart+'<div class="note">'+mins+'</div></td>'+
-        '<td>'+cell+'</td></tr>';
+        '<td>'+cell+'</td>'+
+        '<td><span class="pill '+(t.arrived?'p-on':'p-off')+'">'+t.at+'</span></td></tr>';
     }).join('');
   }catch(e){}
 }
@@ -601,15 +635,15 @@ def main():
 
     if args.once:
         board = build_board(BOOKS, HIST, njt.get_token())
-        print("\n%-7s %-22s %-9s %-7s %-10s %s"
-              % ("TRAIN", "DESTINATION", "DEPARTS", "TRACK", "SOURCE", "CIRCUIT"))
-        print("-" * 76)
+        print("\n%-7s %-22s %-9s %-7s %-12s %-10s %s"
+              % ("TRAIN", "DESTINATION", "DEPARTS", "TRACK", "ARRIVED", "SOURCE", "CIRCUIT"))
+        print("-" * 88)
         for t in board["trains"]:
             p = t["prediction"]
             src = p["tier"] + ("/" + p["signal"] if p.get("signal") else "")
-            print("%-7s %-22s %-9s %-7s %-10s %s"
+            print("%-7s %-22s %-9s %-7s %-12s %-10s %s"
                   % (t["train"], t["destination"][:22], t["depart"],
-                     p["track"] or "--", src, t.get("circuit") or ""))
+                     p["track"] or "--", t["at"], src, t.get("circuit") or ""))
         return
 
     print("\nserving http://%s:%d   (board fetched on request, cached %ds; Ctrl-C to stop)"
