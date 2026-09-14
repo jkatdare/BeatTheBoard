@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS results (
     flipped      INTEGER DEFAULT 0,
     actual       TEXT,          -- official track (NULL = not posted yet)
     posted_at    TEXT,
+    sched_epoch  INTEGER,       -- scheduled departure, UTC epoch seconds
     PRIMARY KEY (service_date, train_id)
 );
 CREATE TABLE IF NOT EXISTS polls (
@@ -73,10 +74,11 @@ def connect():
     conn.executescript(DDL)
     # A check.db left by the earlier credential-based checker lacks this
     # column, and CREATE TABLE IF NOT EXISTS will not add it.
-    try:
-        conn.execute("ALTER TABLE results ADD COLUMN operator TEXT")
-    except sqlite3.OperationalError:
-        pass
+    for col in ("operator TEXT", "sched_epoch INTEGER"):
+        try:
+            conn.execute("ALTER TABLE results ADD COLUMN " + col)
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
@@ -139,12 +141,18 @@ def poll(conn):
         row = conn.execute("SELECT predicted, actual FROM results "
                            "WHERE service_date=? AND train_id=?", (svc, tid)).fetchone()
         meta = (t.get("operator"), t.get("line"), t.get("destination"), t.get("depart"))
+        sched_epoch = t.get("depart_epoch")
+        if sched_epoch is None and t.get("minutes") is not None:
+            # older app without depart_epoch: the countdown was computed at the
+            # app's fetch time, which is `age` seconds before this poll
+            sched_epoch = int(time.time()) - int(data.get("age") or 0) + int(t["minutes"]) * 60
 
         if p.get("tier") in ("official", "verified"):   # both are NJT's posted track
             if row is None:
                 conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
-                             "destination, sched_dep, actual, posted_at) VALUES (?,?,?,?,?,?,?,?)",
-                             (svc, tid) + meta + (p["track"], now))
+                             "destination, sched_dep, actual, posted_at, sched_epoch) "
+                             "VALUES (?,?,?,?,?,?,?,?,?)",
+                             (svc, tid) + meta + (p["track"], now, sched_epoch))
             elif row[1] is None:
                 conn.execute("UPDATE results SET actual=?, posted_at=? "
                              "WHERE service_date=? AND train_id=?", (p["track"], now, svc, tid))
@@ -154,10 +162,10 @@ def poll(conn):
         elif p.get("tier") == "predicted":
             if row is None:
                 conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
-                             "destination, sched_dep, predicted, signal, confidence, predicted_at) "
-                             "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             "destination, sched_dep, predicted, signal, confidence, predicted_at, "
+                             "sched_epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                              (svc, tid) + meta + (p["track"], p.get("signal"),
-                                                  p.get("confidence"), now))
+                                                  p.get("confidence"), now, sched_epoch))
             elif row[0] is None and row[1] is None:
                 conn.execute("UPDATE results SET predicted=?, signal=?, confidence=?, "
                              "predicted_at=? WHERE service_date=? AND train_id=?",
@@ -165,6 +173,9 @@ def poll(conn):
             elif row[0] and row[1] is None and row[0] != p["track"]:
                 conn.execute("UPDATE results SET flipped=1 "
                              "WHERE service_date=? AND train_id=?", (svc, tid))
+        if sched_epoch is not None:
+            conn.execute("UPDATE results SET sched_epoch=? WHERE service_date=? "
+                         "AND train_id=? AND sched_epoch IS NULL", (sched_epoch, svc, tid))
     conn.commit()
 
     for tid, pred, actual in resolved:
@@ -219,8 +230,8 @@ def report():
 
     # ---- 1. accuracy on resolved train-days
     rows = conn.execute("SELECT service_date, train_id, operator, line, predicted, signal, "
-                        "predicted_at, actual, posted_at, flipped FROM results "
-                        "WHERE actual IS NOT NULL ORDER BY posted_at").fetchall()
+                        "predicted_at, actual, posted_at, flipped, sched_dep, sched_epoch "
+                        "FROM results WHERE actual IS NOT NULL ORDER BY posted_at").fetchall()
     print("=" * 68)
     if not rows:
         print("Nothing resolved yet -- no train has posted since checking began.")
@@ -241,6 +252,43 @@ def report():
         if leads:
             print("lead       median %.1f min   p25 %.1f   p75 %.1f   max %.0f"
                   % (leads[len(leads) // 2], leads[len(leads) // 4], leads[3 * len(leads) // 4], leads[-1]))
+
+        def sched_epoch_of(r):
+            if r[11] is not None:
+                return r[11]
+            s = r[10] or ""
+            try:   # rows from before this column, machine-local time
+                try:                                   # first checker: "13-Sep-2026 05:43:00 PM"
+                    d = datetime.strptime(s, "%d-%b-%Y %I:%M:%S %p")
+                except ValueError:                     # app-based checker: "5:43 PM" + service date
+                    d = datetime.strptime(r[0] + " " + s, "%Y-%m-%d %I:%M %p")
+                    if d.hour < SERVICE_DAY_CUTOFF_HOUR:
+                        d += timedelta(days=1)
+                return int(d.replace(tzinfo=datetime.now().astimezone().tzinfo).timestamp())
+            except ValueError:
+                return None
+
+        def epoch(iso):
+            try:
+                return datetime.fromisoformat(iso).timestamp()
+            except (TypeError, ValueError):
+                return None
+
+        def q(x, p):
+            return x[min(len(x) - 1, int(len(x) * p))]
+
+        board_lead = sorted((se - epoch(r[8])) / 60 for r in rows
+                            for se in [sched_epoch_of(r)] if se and epoch(r[8]))
+        ours_lead = sorted((se - epoch(r[6])) / 60 for r in pred
+                           for se in [sched_epoch_of(r)] if se and epoch(r[6]))
+        if board_lead or ours_lead:
+            print("\nminutes before scheduled departure:")
+        if board_lead:
+            print("   NJ Transit posts the track   median %5.1f   p25 %5.1f   p75 %5.1f   (n=%d)"
+                  % (q(board_lead, .5), q(board_lead, .25), q(board_lead, .75), len(board_lead)))
+        if ours_lead:
+            print("   our prediction appears       median %5.1f   p25 %5.1f   p75 %5.1f   (n=%d)"
+                  % (q(ours_lead, .5), q(ours_lead, .25), q(ours_lead, .75), len(ours_lead)))
         print("\nby signal:")
         for sig in ("circuit", "berth"):
             s = [r for r in pred if r[5] == sig]

@@ -435,10 +435,16 @@ def build_board(books, hist, token):
         sched = item.get("SCHED_DEP_DATE")
         try:
             dep = datetime.strptime(sched, "%d-%b-%Y %I:%M:%S %p")
-            mins = int((dep - now_eastern()).total_seconds() / 60)
+            east_now = now_eastern()
+            mins = int((dep - east_now).total_seconds() / 60)
             dep_str = dep.strftime("%I:%M %p").lstrip("0")
+            # scheduled departure as UTC epoch seconds, so clients can measure
+            # leads without knowing the time zone. Eastern -> UTC via the current
+            # offset, exact except for a departure on the far side of a DST change.
+            utc_off = datetime.now(timezone.utc).replace(tzinfo=None) - east_now
+            depart_epoch = int((dep + utc_off).replace(tzinfo=timezone.utc).timestamp())
         except (ValueError, TypeError):
-            mins, dep_str = None, sched or ""
+            mins, dep_str, depart_epoch = None, sched or "", None
         tid = str(item.get("TRAIN_ID", ""))
         rows.append({
             "train": tid,
@@ -447,6 +453,7 @@ def build_board(books, hist, token):
             "line": item.get("LINE", ""),
             "destination": str(item.get("DESTINATION", "")).replace("&#9992", "✈"),
             "depart": dep_str,
+            "depart_epoch": depart_epoch,
             "minutes": mins,
             "status": item.get("STATUS", ""),
             "late": item.get("SEC_LATE"),
