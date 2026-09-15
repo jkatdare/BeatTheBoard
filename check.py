@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS results (
     actual       TEXT,          -- official track (NULL = not posted yet)
     posted_at    TEXT,
     sched_epoch  INTEGER,       -- scheduled departure, UTC epoch seconds
+    watched      INTEGER,       -- 1 = seen before it posted (a fair test); 0 = first seen already posted
     PRIMARY KEY (service_date, train_id)
 );
 CREATE TABLE IF NOT EXISTS polls (
@@ -74,7 +75,7 @@ def connect():
     conn.executescript(DDL)
     # A check.db left by the earlier credential-based checker lacks this
     # column, and CREATE TABLE IF NOT EXISTS will not add it.
-    for col in ("operator TEXT", "sched_epoch INTEGER"):
+    for col in ("operator TEXT", "sched_epoch INTEGER", "watched INTEGER"):
         try:
             conn.execute("ALTER TABLE results ADD COLUMN " + col)
         except sqlite3.OperationalError:
@@ -150,8 +151,8 @@ def poll(conn):
         if p.get("tier") in ("official", "verified"):   # both are NJT's posted track
             if row is None:
                 conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
-                             "destination, sched_dep, actual, posted_at, sched_epoch) "
-                             "VALUES (?,?,?,?,?,?,?,?,?)",
+                             "destination, sched_dep, actual, posted_at, sched_epoch, watched) "
+                             "VALUES (?,?,?,?,?,?,?,?,?,0)",
                              (svc, tid) + meta + (p["track"], now, sched_epoch))
             elif row[1] is None:
                 conn.execute("UPDATE results SET actual=?, posted_at=? "
@@ -163,7 +164,7 @@ def poll(conn):
             if row is None:
                 conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
                              "destination, sched_dep, predicted, signal, confidence, predicted_at, "
-                             "sched_epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                             "sched_epoch, watched) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
                              (svc, tid) + meta + (p["track"], p.get("signal"),
                                                   p.get("confidence"), now, sched_epoch))
             elif row[0] is None and row[1] is None:
@@ -173,6 +174,12 @@ def poll(conn):
             elif row[0] and row[1] is None and row[0] != p["track"]:
                 conn.execute("UPDATE results SET flipped=1 "
                              "WHERE service_date=? AND train_id=?", (svc, tid))
+
+        elif row is None:
+            # on the board, not posted, no prediction yet: we are watching it
+            conn.execute("INSERT INTO results (service_date, train_id, operator, line, "
+                         "destination, sched_dep, sched_epoch, watched) VALUES (?,?,?,?,?,?,?,1)",
+                         (svc, tid) + meta + (sched_epoch,))
         if sched_epoch is not None:
             conn.execute("UPDATE results SET sched_epoch=? WHERE service_date=? "
                          "AND train_id=? AND sched_epoch IS NULL", (sched_epoch, svc, tid))
@@ -190,11 +197,12 @@ def poll(conn):
 
 
 def scoreline(conn):
-    n_res = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NOT NULL").fetchone()[0]
-    n_pred = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NOT NULL "
-                          "AND predicted IS NOT NULL").fetchone()[0]
-    n_hit = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NOT NULL "
-                         "AND predicted = actual").fetchone()[0]
+    fair = "actual IS NOT NULL AND (watched IS NULL OR watched = 1)"
+    n_res = conn.execute("SELECT COUNT(*) FROM results WHERE " + fair).fetchone()[0]
+    n_pred = conn.execute("SELECT COUNT(*) FROM results WHERE " + fair +
+                          " AND predicted IS NOT NULL").fetchone()[0]
+    n_hit = conn.execute("SELECT COUNT(*) FROM results WHERE " + fair +
+                         " AND predicted = actual").fetchone()[0]
     cov = 100.0 * n_pred / n_res if n_res else 0
     acc = 100.0 * n_hit / n_pred if n_pred else 0
     return "resolved %d | predicted %d (%.0f%%) | correct %.1f%%" % (n_res, n_pred, cov, acc)
@@ -231,7 +239,10 @@ def report():
     # ---- 1. accuracy on resolved train-days
     rows = conn.execute("SELECT service_date, train_id, operator, line, predicted, signal, "
                         "predicted_at, actual, posted_at, flipped, sched_dep, sched_epoch "
-                        "FROM results WHERE actual IS NOT NULL ORDER BY posted_at").fetchall()
+                        "FROM results WHERE actual IS NOT NULL AND (watched IS NULL OR watched = 1) "
+                        "ORDER BY posted_at").fetchall()
+    unwatched = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NOT NULL "
+                             "AND watched = 0").fetchone()[0]
     print("=" * 68)
     if not rows:
         print("Nothing resolved yet -- no train has posted since checking began.")
@@ -243,6 +254,9 @@ def report():
         leads = sorted(x for x in (minutes(r[6], r[8]) for r in pred) if x is not None and x > -1)
         print("ARE THE PREDICTIONS RIGHT?   %d train-days, %s .. %s" % (len(rows), days[0], days[-1]))
         print("=" * 68)
+        if unwatched:
+            print("(%d more trains were already posted when first seen -- never predictable, excluded)"
+                  % unwatched)
         print("coverage   %5.1f%%   (%d of %d departures had a prediction before posting)"
               % (100.0 * len(pred) / len(rows), len(pred), len(rows)))
         print("accuracy   %5.1f%%   (%d right, %d wrong)"

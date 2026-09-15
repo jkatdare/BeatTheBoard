@@ -1,83 +1,92 @@
 {
- "built_at": "2026-09-12T21:06:31.121814+00:00",
+ "built_at": "2026-09-14T20:05:53.885842+00:00",
  "sources": {
   "track_history.db": 180650,
-  "benchmark.db": 7852
+  "benchmark.db": 7979
  },
  "gps": {
   "40.75077,-73.99413": {
    "track": "2",
    "n": 6731,
+   "days": 244,
    "purity": 0.985
   },
   "40.7505,-73.9935": {
    "track": "12",
    "n": 4443,
+   "days": 156,
    "purity": 0.999
   },
   "40.75025,-73.99289": {
    "track": "3",
-   "n": 5726,
+   "n": 5752,
+   "days": 208,
    "purity": 0.987
   },
   "40.7499,-73.9922": {
    "track": "11",
    "n": 3329,
+   "days": 112,
    "purity": 0.999
   },
   "40.7509,-73.9948": {
    "track": "12",
-   "n": 345,
-   "purity": 0.991
+   "n": 360,
+   "days": 23,
+   "purity": 0.992
   },
   "40.7506,-73.9939": {
    "track": "13",
-   "n": 5191,
+   "n": 5211,
+   "days": 180,
    "purity": 1.0
   },
   "40.7511,-73.9948": {
    "track": "1",
    "n": 3157,
+   "days": 116,
    "purity": 0.997
   },
   "40.7508,-73.9947": {
    "track": "13",
    "n": 47,
+   "days": 17,
    "purity": 1.0
   },
   "40.750,-73.9925": {
    "track": "12",
    "n": 471,
+   "days": 16,
    "purity": 1.0
   },
   "40.7499,-73.9923": {
    "track": "14",
    "n": 579,
+   "days": 19,
    "purity": 0.998
   },
   "40.7503,-73.9931": {
    "track": "13",
    "n": 240,
+   "days": 14,
    "purity": 1.0
   },
   "40.7511,-73.9954": {
    "track": "13",
    "n": 48,
+   "days": 7,
    "purity": 1.0
   },
   "40.7513,-73.9958": {
    "track": "13",
    "n": 4,
+   "days": 4,
    "purity": 1.0
   },
   "40.7513,-73.9956": {
    "track": "12",
    "n": 58,
-   "purity": 1.0
-  },
-  "40.7500,-73.9924": {
-   "track": "10",
-   "n": 40,
+   "days": 7,
    "purity": 1.0
   }
  },
@@ -85,202 +94,206 @@
   "AA-A180TK": {
    "track": "4",
    "n": 2490,
+   "days": 206,
    "purity": 1.0
   },
   "AA-A200TK": {
    "track": "2",
    "n": 2945,
+   "days": 241,
    "purity": 1.0
   },
   "AA-A190TK": {
    "track": "3",
-   "n": 2476,
+   "n": 2489,
+   "days": 207,
    "purity": 0.991
   },
   "JO-AJO16TK": {
    "track": "6",
    "n": 524,
+   "days": 37,
    "purity": 1.0
   },
   "AA-AAJO11ATK": {
    "track": "11",
    "n": 775,
+   "days": 62,
    "purity": 1.0
   },
   "AA-AAJO12ATK": {
    "track": "10",
    "n": 1070,
+   "days": 80,
    "purity": 0.993
   },
   "AA-111DP": {
    "track": "8",
-   "n": 256,
+   "n": 257,
+   "days": 36,
    "purity": 1.0
   },
   "AA-135UN": {
    "track": "4",
    "n": 35,
+   "days": 32,
    "purity": 1.0
   },
   "AA-A210TK": {
    "track": "1",
    "n": 982,
+   "days": 83,
    "purity": 0.994
   },
   "AA-141R": {
    "track": "2",
    "n": 35,
+   "days": 28,
    "purity": 1.0
   },
   "AA-141UN": {
    "track": "3",
    "n": 86,
+   "days": 54,
    "purity": 1.0
   },
   "AA-143R": {
    "track": "1",
    "n": 53,
+   "days": 41,
    "purity": 1.0
   },
   "AA-137N": {
    "track": "4",
    "n": 120,
+   "days": 39,
    "purity": 1.0
   },
   "AA-145R": {
    "track": "1",
    "n": 1450,
+   "days": 141,
    "purity": 0.963
   },
   "JO-AJO14ATK": {
    "track": "8",
-   "n": 408,
+   "n": 409,
+   "days": 36,
    "purity": 1.0
   },
   "AA-AAJO10ATK": {
    "track": "12",
    "n": 752,
+   "days": 63,
    "purity": 0.988
   },
   "JO-AJO15ATK": {
    "track": "7",
    "n": 767,
+   "days": 67,
    "purity": 1.0
   },
   "AA-A141TK": {
    "track": "8",
-   "n": 24,
+   "n": 40,
+   "days": 18,
    "purity": 1.0
   },
   "AA-A91TK": {
    "track": "13",
    "n": 26,
+   "days": 20,
    "purity": 1.0
   },
   "AA-A101TK": {
    "track": "12",
    "n": 57,
+   "days": 19,
    "purity": 0.965
   },
   "AA-111UN": {
    "track": "9",
    "n": 212,
+   "days": 43,
    "purity": 1.0
   },
   "AA-A132TK": {
    "track": "9",
    "n": 144,
+   "days": 41,
    "purity": 1.0
   },
   "AA-49DP": {
    "track": "12",
    "n": 132,
+   "days": 20,
    "purity": 0.985
   },
   "AA-143N": {
    "track": "2",
    "n": 32,
+   "days": 24,
    "purity": 1.0
   },
   "JO-AJO13ATK": {
    "track": "9",
    "n": 815,
+   "days": 70,
    "purity": 0.993
   },
   "AA-AAJO9ATK": {
    "track": "13",
-   "n": 959,
+   "n": 983,
+   "days": 84,
    "purity": 1.0
   },
   "JO-AJO7ATK": {
    "track": "15",
    "n": 85,
+   "days": 11,
    "purity": 0.988
   },
   "AA-A71TK": {
    "track": "15",
    "n": 20,
+   "days": 6,
    "purity": 1.0
   },
   "JO-AJO10ATK": {
    "track": "12",
    "n": 46,
+   "days": 11,
    "purity": 1.0
   },
   "AA-45DN": {
    "track": "14",
    "n": 153,
+   "days": 14,
    "purity": 0.987
   },
   "JO-AJO9ATK": {
    "track": "13",
    "n": 42,
+   "days": 9,
    "purity": 1.0
   },
   "AA-A82TK": {
    "track": "14",
    "n": 158,
+   "days": 22,
    "purity": 0.968
-  },
-  "CC-635N": {
-   "track": "13",
-   "n": 24,
-   "purity": 0.958
-  },
-  "JO-AJO14BTK": {
-   "track": "8",
-   "n": 22,
-   "purity": 1.0
-  },
-  "AA-129DN": {
-   "track": "2",
-   "n": 22,
-   "purity": 1.0
-  },
-  "LK-37DP": {
-   "track": "10",
-   "n": 30,
-   "purity": 1.0
   },
   "JO-AJO10BTK": {
    "track": "12",
    "n": 29,
-   "purity": 1.0
-  },
-  "JO-AJO12BTK": {
-   "track": "10",
-   "n": 21,
+   "days": 3,
    "purity": 1.0
   },
   "JO-AJO13BTK": {
    "track": "9",
    "n": 66,
+   "days": 3,
    "purity": 1.0
-  },
-  "F2-45TK": {
-   "track": "12",
-   "n": 31,
-   "purity": 0.968
   }
  }
 }

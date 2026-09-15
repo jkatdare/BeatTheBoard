@@ -80,6 +80,7 @@ CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "20"))
 
 GPS_MIN_N, GPS_MIN_PURITY = 3, 0.98    # chosen by held-out sweep
 CKT_MIN_N, CKT_MIN_PURITY = 20, 0.95
+MIN_DAYS = 3                           # distinct train-days an entry must be seen on
 
 NYP_LAT, NYP_LON, PENN_BOX = 40.7498, -73.9918, 0.006
 
@@ -104,7 +105,10 @@ def _open_ro(path):
 
 # ---------------------------------------------------------------- codebooks
 
-def _sift(votes, min_n, min_purity):
+def _sift(votes, days, min_n, min_purity):
+    """Rows alone are weak evidence: a train parked on one circuit for 40 minutes
+    is 40 rows from a single train-day. An entry must also be seen on MIN_DAYS
+    distinct train-days pointing at the same track."""
     book, rejected = {}, []
     for key, counter in votes.items():
         total = sum(counter.values())
@@ -112,14 +116,15 @@ def _sift(votes, min_n, min_purity):
             continue
         track, n = counter.most_common(1)[0]
         purity = n / total
-        if purity >= min_purity:
-            book[key] = {"track": track, "n": total, "purity": round(purity, 3)}
+        nd = len(days[key][track])
+        if purity >= min_purity and nd >= MIN_DAYS:
+            book[key] = {"track": track, "n": total, "days": nd, "purity": round(purity, 3)}
         else:
             rejected.append((key, dict(counter)))
     return book, rejected
 
 
-def _votes_from_history(gvotes, cvotes):
+def _votes_from_history(gvotes, cvotes, gdays, cdays):
     """run_logger.py's DB. Berth votes from posted rows at Penn; circuit votes
     from every vehicle row of a train-day, against the track it finally posted."""
     conn = _open_ro(HISTORY_DB)
@@ -127,15 +132,17 @@ def _votes_from_history(gvotes, cvotes):
         return 0
     n = 0
     try:
-        for lat, lon, track in conn.execute(
-                "SELECT gps_lat, gps_lon, track FROM observations "
+        for tid, sd, lat, lon, track in conn.execute(
+                "SELECT train_id, service_date, gps_lat, gps_lon, track FROM observations "
                 "WHERE gps_lat IS NOT NULL AND track != '' AND at_penn = 1"):
             t = str(track).strip()
             if t.isdigit():
                 gvotes[lat + "," + lon][t] += 1
+                gdays[lat + "," + lon][t].add((tid, sd))
                 n += 1
-        for ckt, track in conn.execute(
-                "SELECT v.ics_track_ckt, p.track FROM vehicle_positions v "
+        for tid, sd, ckt, track in conn.execute(
+                "SELECT v.train_id, v.service_date, v.ics_track_ckt, p.track "
+                "FROM vehicle_positions v "
                 "JOIN track_postings p ON p.train_id = v.train_id "
                 "                      AND p.service_date = v.service_date "
                 "WHERE v.ics_track_ckt IS NOT NULL AND v.ics_track_ckt != '' "
@@ -143,6 +150,7 @@ def _votes_from_history(gvotes, cvotes):
             t = str(track).strip()
             if t.isdigit():
                 cvotes[ckt][t] += 1
+                cdays[ckt][t].add((tid, sd))
                 n += 1
     except sqlite3.OperationalError:
         pass
@@ -151,7 +159,7 @@ def _votes_from_history(gvotes, cvotes):
     return n
 
 
-def _votes_from_benchmark(gvotes, cvotes):
+def _votes_from_benchmark(gvotes, cvotes, gdays, cdays):
     """benchmark.py's DB. Each njt row carries the board item (with GPS) and the
     circuit the vehicle feed showed for that train at that moment (_circuit).
     Truth is the first official track for the train-day."""
@@ -181,10 +189,12 @@ def _votes_from_benchmark(gvotes, cvotes):
             lat, lon = item.get("GPSLATITUDE"), item.get("GPSLONGITUDE")
             if is_off and lat and lon and _near_penn(lat, lon):
                 gvotes[str(lat) + "," + str(lon)][t] += 1
+                gdays[str(lat) + "," + str(lon)][t].add((tid, sd))
                 n += 1
             ckt = item.get("_circuit")
             if ckt:
                 cvotes[ckt][t] += 1
+                cdays[ckt][t].add((tid, sd))
                 n += 1
     except sqlite3.OperationalError:
         pass
@@ -195,14 +205,16 @@ def _votes_from_benchmark(gvotes, cvotes):
 
 def build_codebooks(verbose=True):
     gvotes, cvotes = defaultdict(Counter), defaultdict(Counter)
-    n_hist = _votes_from_history(gvotes, cvotes)
-    n_bench = _votes_from_benchmark(gvotes, cvotes)
+    gdays = defaultdict(lambda: defaultdict(set))
+    cdays = defaultdict(lambda: defaultdict(set))
+    n_hist = _votes_from_history(gvotes, cvotes, gdays, cdays)
+    n_bench = _votes_from_benchmark(gvotes, cvotes, gdays, cdays)
     if not (n_hist or n_bench):
         sys.exit("No data to learn from: neither %s nor %s has observations yet."
                  % (HISTORY_DB, BENCH_DB))
 
-    gps, grej = _sift(gvotes, GPS_MIN_N, GPS_MIN_PURITY)
-    cir, crej = _sift(cvotes, CKT_MIN_N, CKT_MIN_PURITY)
+    gps, grej = _sift(gvotes, gdays, GPS_MIN_N, GPS_MIN_PURITY)
+    cir, crej = _sift(cvotes, cdays, CKT_MIN_N, CKT_MIN_PURITY)
     payload = {"built_at": datetime.now(timezone.utc).isoformat(),
                "sources": {HISTORY_DB: n_hist, BENCH_DB: n_bench},
                "gps": gps, "circuits": cir}
