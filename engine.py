@@ -493,22 +493,32 @@ def get_board():
         age = time.time() - CACHE["at"]
         if CACHE["board"] is not None and age < CACHE_SECONDS:
             return CACHE["board"], CACHE["error"], round(age)
+        if time.time() < CACHE.get("hold_until", 0):
+            return CACHE["board"], CACHE["error"], round(age)
         for attempt in (1, 2):
             try:
                 if not CACHE["token"]:
-                    CACHE["token"] = njt.get_token()
+                    # attempt 1 reuses whatever is cached; attempt 2 runs only
+                    # after NJT rejected that token and forces a fresh mint.
+                    # Minting is limited to ~10/day, so never mint speculatively.
+                    CACHE["token"] = njt.get_token(force=(attempt == 2))
                 CACHE["board"] = build_board(BOOKS, HIST, CACHE["token"])
                 CACHE["error"] = None
                 CACHE["at"] = time.time()
                 break
             except njt.AuthError:
-                CACHE["token"] = None            # re-mint once, then give up
+                CACHE["token"] = None
                 if attempt == 2:
                     CACHE["error"] = "could not authenticate with NJT"
+                    CACHE["at"] = time.time()
             except (Exception, SystemExit) as e:
                 # keep serving the last good board, with the error shown
                 CACHE["error"] = type(e).__name__ + ": " + str(e)
                 CACHE["at"] = time.time()        # do not retry on every request
+                if "QUOTA" in str(e):
+                    # the daily mint limit is spent; every retry burns another
+                    # attempt against tomorrow's count. Hold for an hour.
+                    CACHE["hold_until"] = time.time() + 3600
                 break
         return CACHE["board"], CACHE["error"], 0
 

@@ -56,7 +56,11 @@ DB_PATH = os.environ.get("NJT_DB", "track_history.db")
 VEHICLE_EVERY_N = int(os.environ.get("NJT_VEHICLE_EVERY_N", "2"))
 
 TOKEN_CACHE = os.environ.get("NJT_TOKEN_CACHE", ".njt_token.json")
-TOKEN_TTL_HOURS = float(os.environ.get("NJT_TOKEN_TTL_HOURS", "12"))
+# NJT allows only ~10 token mints per day ("Daily usage limit:10"), so a cached
+# token is reused until the API actually rejects it -- every caller re-mints
+# once on AuthError -- rather than refreshed on a timer. The TTL is only a
+# backstop against a token that is somehow never rejected.
+TOKEN_TTL_HOURS = float(os.environ.get("NJT_TOKEN_TTL_HOURS", "168"))
 
 # Service day rolls at 3am so late-night trains group with the correct date.
 SERVICE_DAY_CUTOFF_HOUR = 3
