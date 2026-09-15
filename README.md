@@ -1,4 +1,4 @@
-# BeatTheBoard
+# BeatTheBoard  https://beattheboard.thankfulpond-632cee48.eastus2.azurecontainerapps.io
 
 I work in NYC and live in NJ, so I take NJ Transit out of Penn Station, and I wanted to get on the train before the crowd of people form. 
 
