@@ -96,8 +96,8 @@ def platform_of(track):
 
 def poll_njt(conn, token, books):
     circuits = engine.fetch_circuits(token)
-    payload = njt.api_post("getTrainSchedule",
-                           {"token": token, "station": njt.STATION})
+    payload = njt.api_post("getTrainSchedule19Rec",
+                           {"token": token, "station": njt.STATION, "line": ""})
     seen_at = datetime.now(timezone.utc).isoformat()
     svc = service_date_for(datetime.now())
     n_pred = 0

@@ -434,8 +434,11 @@ def remember(tid, p):
 def build_board(books, hist, token):
     vehicles = fetch_vehicles(token)
     circuits = {tid: v["ckt"] for tid, v in vehicles.items() if v["ckt"]}
-    payload = njt.api_post("getTrainSchedule",
-                           {"token": token, "station": njt.STATION})
+    # 19Rec is the endpoint NJ Transit designates for real-time use (their
+    # support classes getTrainSchedule as "schedule data"). Same fields, same
+    # rows, higher assured limit.
+    payload = njt.api_post("getTrainSchedule19Rec",
+                           {"token": token, "station": njt.STATION, "line": ""})
     rows = []
     for item in njt.board_items(payload):
         if NJT_ONLY and not str(item.get("TRAIN_ID", "")).strip().isdigit():
