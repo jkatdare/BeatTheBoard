@@ -87,6 +87,7 @@ Everything is standard library Python. There is nothing to install.
 
 ## Running it
 ** You must register your NJT account for the developer portal @ https://developer.njtransit.com/registration/register
+
 Create a file called .env with your NJ Transit developer credentials:
 
     NJT_USERNAME=your_portal_username
