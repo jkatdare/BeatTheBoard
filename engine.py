@@ -487,6 +487,9 @@ def build_board(books, hist, token):
             "operator": ("Amtrak" if tid[:1] == "A" else "SEPTA" if tid[:1] == "S"
                          else "Non-revenue" if tid[:1] == "X" else "NJT"),
             "line": item.get("LINE", ""),
+            # NJ Transit's own line colour, stable per line regardless of
+            # status (Amtrak's is the yellow one, and those rows are filtered out)
+            "color": item.get("BACKCOLOR") or "",
             "destination": str(item.get("DESTINATION", "")).replace("&#9992", "✈"),
             "depart": dep_str,
             "depart_epoch": depart_epoch,
@@ -616,106 +619,104 @@ class Handler(BaseHTTPRequestHandler):
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Penn Track Engine</title><style>
-:root{--bg:#f7f7f5;--card:#fff;--fg:#1a1a18;--dim:#6b6b66;--line:#e4e4e0;
---official:#0a7d32;--official-bg:#e8f5ec;--pred:#1257a8;--pred-bg:#e8f0fb;
---hist:#8a6d1f;--hist-bg:#fbf4e2;--none:#8a8a85;}
-@media(prefers-color-scheme:dark){:root{--bg:#16161a;--card:#1e1e24;--fg:#ececf0;
---dim:#9a9aa4;--line:#2e2e36;--official:#4ade80;--official-bg:#132a1c;
---pred:#7cb0f5;--pred-bg:#12233c;--hist:#e0be62;--hist-bg:#2e2712;--none:#71717a;}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
-.wrap{max-width:940px;margin:0 auto;padding:20px 16px 60px}
-h1{font-size:20px;margin:0 0 2px}.sub{color:var(--dim);font-size:13px;margin-bottom:18px}
-.stats{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;
-padding:8px 12px;font-size:12px}.stat b{display:block;font-size:17px;margin-top:2px}
-table{width:100%;border-collapse:collapse;background:var(--card);
-border:1px solid var(--line);border-radius:10px;overflow:hidden}
-th{text-align:left;font-size:11px;letter-spacing:.05em;text-transform:uppercase;
-color:var(--dim);padding:10px 12px;border-bottom:1px solid var(--line);font-weight:600}
-td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-tr:last-child td{border-bottom:none}
-.trk{font-size:19px;font-weight:700;letter-spacing:-.02em}
-.badge{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;
-padding:2px 6px;border-radius:4px;text-transform:uppercase;margin-top:3px;margin-right:4px}
-.b-official{background:var(--official-bg);color:var(--official)}
-.b-predicted{background:var(--pred-bg);color:var(--pred)}
-.b-history{background:var(--hist-bg);color:var(--hist)}
-.b-verified{background:var(--official-bg);color:var(--official)}
-.pill{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;padding:3px 8px;border-radius:4px;text-transform:uppercase;white-space:nowrap;margin-top:2px}
-.p-on{background:var(--official-bg);color:var(--official)}
-.p-off{background:var(--line);color:var(--dim)}
-.miss{font-size:12px;color:var(--hist);margin-top:3px}
-.dim{color:var(--dim)}.note{font-size:12px;color:var(--dim);margin-top:3px}
-.dash{color:var(--none);font-size:19px}
-.cand{font-size:12px;color:var(--dim)}
-.op{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
-.err{background:#fde8e8;color:#9b1c1c;padding:10px 12px;border-radius:8px;margin-bottom:14px}
-footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
-.score{margin-top:26px}
-.score h2{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);font-weight:600;margin:0 0 10px}
-.score h2 span{text-transform:none;letter-spacing:0;font-weight:400}
-.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:8px}
-.sitem{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
-.sitem .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
-.sitem .v{font-size:20px;font-weight:700;margin-top:3px;letter-spacing:-.02em}
-.sitem .n{font-size:11px;color:var(--dim);margin-top:2px;min-height:14px}
+<title>BeatTheBoard - NY Penn</title><style>
+:root{--bg:#f6f6f4;--card:#fff;--fg:#17171a;--dim:#6b6b73;--faint:#9b9ba3;--line:#e6e6e2;
+--ok:#0a7d32;--okbg:#e7f4eb;--pred:#1257a8;--predbg:#e7f0fb;--warn:#8a6d1f;--warnbg:#fbf4e2;}
+@media(prefers-color-scheme:dark){:root{--bg:#131316;--card:#1d1d22;--fg:#ececee;--dim:#9a9aa4;
+--faint:#6c6c76;--line:#2c2c33;--ok:#4ade80;--okbg:#122a1b;--pred:#7cb0f5;--predbg:#11233d;
+--warn:#e0be62;--warnbg:#2d2712;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:22px 16px 64px}
+h1{font-size:19px;font-weight:600;margin:0;letter-spacing:-.01em}
+.sub{color:var(--dim);font-size:13px;margin-top:2px}
+.tally{color:var(--faint);font-size:12px;margin:14px 0 10px}
+.err{background:var(--warnbg);color:var(--warn);padding:10px 12px;border-radius:8px;
+font-size:13px;margin-bottom:12px}
+.board{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.row{display:flex;align-items:center;gap:14px;padding:13px 16px 13px 13px;
+border-bottom:1px solid var(--line);border-left:4px solid transparent}
+.row:last-child{border-bottom:none}
+.main{flex:1;min-width:0}
+.dest{font-size:15px;font-weight:500;letter-spacing:-.01em;white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis}
+.meta{font-size:12.5px;color:var(--dim);margin-top:2px}
+.note{font-size:12px;color:var(--faint);margin-top:3px}
+.miss{font-size:12px;color:var(--warn);margin-top:3px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;
+vertical-align:1px;background:var(--faint)}
+.dot.on{background:var(--ok)}
+.right{text-align:right;flex-shrink:0;min-width:74px}
+.trk{font-size:38px;font-weight:600;line-height:.92;letter-spacing:-.035em;
+font-variant-numeric:tabular-nums}
+.trk.ok{color:var(--ok)}.trk.pred{color:var(--pred)}.trk.off{color:var(--faint);font-size:30px}
+.tier{font-size:11.5px;margin-top:4px;letter-spacing:.01em}
+.tier.ok{color:var(--ok)}.tier.pred{color:var(--pred)}
+.tier.warn{color:var(--warn)}.tier.off{color:var(--faint)}
+.cand{font-size:12px;color:var(--faint);margin-top:3px}
+h2{font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+color:var(--faint);margin:30px 0 10px}
+h2 span{text-transform:none;letter-spacing:0;font-weight:400}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;
+background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.sitem{background:var(--card);padding:12px 14px}
+.sk{font-size:11px;color:var(--faint);letter-spacing:.04em;text-transform:uppercase}
+.sv{font-size:21px;font-weight:600;margin-top:3px;letter-spacing:-.02em;
+font-variant-numeric:tabular-nums}
+.sn{font-size:11.5px;color:var(--faint);margin-top:1px;min-height:15px}
+footer{margin-top:26px;font-size:12px;color:var(--faint);line-height:1.75}
+footer b{color:var(--dim);font-weight:500}
 </style></head><body><div class="wrap">
-<h1>NY Penn - Track Engine</h1>
-<div class="sub" id="sub">loading...</div>
-<div class="stats" id="stats"></div>
+<h1>NY Penn</h1>
+<div class="sub" id="sub">loading</div>
+<div class="tally" id="tally"></div>
 <div id="err"></div>
-<table><thead><tr><th>Train</th><th>Destination</th><th>Departs</th><th>Track</th><th>Arrived</th></tr></thead>
-<tbody id="rows"></tbody></table>
-<section class="score">
+<div class="board" id="rows"></div>
+
 <h2>Live scorecard <span id="scorewhen"></span></h2>
 <div class="sgrid" id="sgrid"></div>
-</section>
+
 <footer>
-<div><b>predicted</b> (blue, with a percentage) - we have made a call; NJ Transit has not posted the track yet, so nothing has confirmed or denied it.</div>
-<div><b>verified</b> (green, 100%) - we predicted it, then NJ Transit posted the same track. Prediction confirmed.</div>
-<div><b>official</b> (green, no percentage) - NJ Transit has posted the track and we have no confirmed prediction to show for it. That is two cases: we never predicted this train (no signal), or we predicted it wrong - in which case an amber line underneath says "we predicted 12 - that was wrong."</div>
-<div><b>history</b> - what this train number has done on past days. Context only, not a prediction.</div>
-<div>Always confirm on the station display before boarding.</div>
+<div><b>confirmed</b> - we called it early, then NJ Transit posted the same track.</div>
+<div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it.</div>
+<div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, or we got it wrong - and if we got it wrong, it says so underneath.</div>
+<div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
+<div>The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
 <script>
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 async function tick(){
   try{
-    const r = await fetch('/api/board'); const d = await r.json();
-    document.getElementById('err').innerHTML = d.error ? '<div class="err">'+d.error+'</div>' : '';
+    const d = await (await fetch('/api/board')).json();
+    document.getElementById('err').innerHTML = d.error ? '<div class="err">'+esc(d.error)+'</div>' : '';
     if(!d.board){return;}
     const b = d.board;
-    document.getElementById('sub').textContent = b.station + ' - updated ' + b.fetched_at;
-    let off=0,pred=0,ver=0,none=0;
+    document.getElementById('sub').textContent = 'updated ' + b.fetched_at;
+    let off=0,pred=0,none=0;
     b.trains.forEach(t=>{const k=t.prediction.tier;
-      if(k==='official'||k==='verified'){off++; if(k==='verified')ver++;}
-      else if(k==='predicted')pred++; else none++;});
-    document.getElementById('stats').innerHTML =
-      '<div class="stat">Trains<b>'+b.trains.length+'</b></div>'+
-      '<div class="stat">On the board<b>'+off+'</b></div>'+
-      '<div class="stat">Predicted early<b>'+pred+'</b></div>'+
-      '<div class="stat">Verified<b>'+ver+'</b></div>'+
-      '<div class="stat">No signal<b>'+none+'</b></div>';
+      if(k==='official'||k==='verified')off++; else if(k==='predicted')pred++; else none++;});
+    document.getElementById('tally').textContent =
+      b.trains.length+' trains \u00b7 '+off+' on the board \u00b7 '+pred+' predicted \u00b7 '+none+' waiting';
     document.getElementById('rows').innerHTML = b.trains.map(t=>{
-      const p=t.prediction; let cell;
-      if(p.track){
-        cell='<div class="trk">'+p.track+'</div><span class="badge b-'+p.tier+'">'+
-          p.tier+(p.confidence?' '+Math.round(p.confidence*100)+'%':'')+'</span>'+
-          (p.note?'<div class="note">'+p.note+'</div>':'')+
-          (p.missed?'<div class="miss">we predicted '+p.missed+' - that was wrong</div>':'');
-      } else if(p.tier==='history'){
-        cell='<div class="dash">--</div><span class="badge b-history">history</span>'+
-          '<div class="cand">usually '+p.candidates.map(c=>c.track+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>';
-      } else {
-        cell='<div class="dash">--</div><div class="note">not yet posted</div>';
-      }
-      const mins = t.minutes===null?'':(t.minutes<=0?'<b>now</b>':t.minutes+' min');
-      return '<tr><td><b>'+t.train+'</b><div class="op">'+t.operator+'</div></td>'+
-        '<td>'+t.destination+'<div class="note">'+t.line+'</div></td>'+
-        '<td>'+t.depart+'<div class="note">'+mins+'</div></td>'+
-        '<td>'+cell+'</td>'+
-        '<td><span class="pill '+(t.arrived?'p-on':'p-off')+'">'+t.at+'</span></td></tr>';
+      const p=t.prediction; let num='--', ncls='off', tier='', tcls='off', extra='';
+      if(p.tier==='verified'){ num=p.track; ncls='ok'; tcls='ok'; tier='confirmed'; }
+      else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
+        if(p.missed) extra='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>'; }
+      else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
+        tier='predicted'+(p.confidence?' '+Math.round(p.confidence*100)+'%':''); }
+      else if(p.tier==='history'){ tcls='off'; tier='no signal';
+        extra='<div class="cand">usually '+p.candidates.map(c=>esc(c.track)+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>'; }
+      else { tier='not posted'; }
+      if(p.track && p.note) extra = '<div class="note">'+esc(p.note)+'</div>' + extra;
+      const mins = t.minutes===null?'':(t.minutes<=0?'now':'in '+t.minutes+' min');
+      const meta = [esc(t.line), esc(t.depart), mins].filter(Boolean).join(' \u00b7 ');
+      return '<div class="row" style="border-left-color:'+(esc(t.color)||'transparent')+'">'+
+        '<div class="main"><div class="dest">'+esc(t.destination)+'</div>'+
+        '<div class="meta"><span class="dot'+(t.arrived?' on':'')+'"></span>'+meta+'</div>'+
+        extra+'</div>'+
+        '<div class="right"><div class="trk '+ncls+'">'+esc(num)+'</div>'+
+        '<div class="tier '+tcls+'">'+esc(tier)+'</div></div></div>';
     }).join('');
   }catch(e){}
 }
@@ -724,22 +725,22 @@ async function score(){
     const s = await (await fetch('/api/stats')).json();
     const g = document.getElementById('sgrid');
     if(!s.scored){
-      g.innerHTML = '<div class="sitem"><div class="k">Nothing scored yet</div>'+
-        '<div class="n">Numbers appear once trains start posting.</div></div>';
+      g.innerHTML='<div class="sitem"><div class="sk">Nothing scored yet</div>'+
+        '<div class="sn">Numbers appear once trains start posting.</div></div>';
       return;
     }
     document.getElementById('scorewhen').textContent =
-      '· ' + s.days + (s.days===1?' day':' days') + ' · ' + s.first_day + ' to ' + s.last_day;
-    const m = v => (v===null||v===undefined) ? '--' : v + ' min';
-    const item = (k,v,n) => '<div class="sitem"><div class="k">'+k+'</div>'+
-      '<div class="v">'+v+'</div><div class="n">'+(n||'')+'</div></div>';
+      '\u00b7 '+s.days+(s.days===1?' day':' days')+' \u00b7 '+s.first_day+' to '+s.last_day;
+    const m = v => (v===null||v===undefined)?'--':v+' min';
+    const it = (k,v,n) => '<div class="sitem"><div class="sk">'+k+'</div><div class="sv">'+v+
+      '</div><div class="sn">'+(n||'')+'</div></div>';
     g.innerHTML =
-      item('Departures scored', s.scored, '') +
-      item('Predicted', s.coverage+'%', s.predicted+' of '+s.scored) +
-      item('Correct', s.accuracy===null?'--':s.accuracy+'%', s.correct+' of '+s.predicted) +
-      item('Changed its mind', s.flip_rate===null?'--':s.flip_rate+'%', s.flips+' of '+s.predicted) +
-      item('Ahead of the board', m(s.lead_over_board), 'median') +
-      item('Before departure', m(s.ours_before_departure), 'NJ Transit: '+m(s.njt_before_departure));
+      it('Scored', s.scored, 'departures') +
+      it('Predicted', s.coverage+'%', s.predicted+' of '+s.scored) +
+      it('Correct', s.accuracy===null?'--':s.accuracy+'%', s.correct+' of '+s.predicted) +
+      it('Flips', s.flip_rate===null?'--':s.flip_rate+'%', 'changed before posting') +
+      it('Ahead of board', m(s.lead_over_board), 'median') +
+      it('Before departure', m(s.ours_before_departure), 'NJ Transit '+m(s.njt_before_departure));
   }catch(e){}
 }
 tick(); setInterval(tick, 15000);
