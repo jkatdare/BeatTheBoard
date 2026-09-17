@@ -794,8 +794,7 @@ async function score(){
       const used = s.tokens.used, lim = s.tokens.limit || 10;
       tk.className = 'tokens' + (used >= lim - 3 ? ' warn' : '');
       tk.innerHTML = 'API tokens minted today <b>' + used + ' / ' + lim + '</b>' +
-        (used >= lim ? ' \u00b7 limit reached, predictions resume after midnight'
-                     : ' \u00b7 each deploy or restart spends one');
+        (used >= lim ? ' \u00b7 limit reached, predictions resume after midnight');
     } else { tk.textContent = ''; }
     const g = document.getElementById('sgrid');
     if(!s.scored){
