@@ -424,6 +424,22 @@ def predict(item, books, circuits, hist):
 # rider here can board, so they are dropped. Set NJT_ONLY=0 to show them again.
 NJT_ONLY = os.environ.get("NJT_ONLY", "1") != "0"
 
+# The board sends truncated display names ("Northeast Corrdr", "No Jersey
+# Coast"). LINECODE is stable, so map on that and fall back to what was sent.
+LINE_NAMES = {
+    "NE": "Northeast Corridor Line",
+    "NC": "North Jersey Coast Line",
+    "ME": "Morristown Line",
+    "GS": "Gladstone Branch",
+    "MC": "Montclair-Boonton Line",
+    "RV": "Raritan Valley Line",
+}
+
+
+def line_name(item):
+    return LINE_NAMES.get(str(item.get("LINECODE") or "").strip().upper(),
+                          item.get("LINE") or "")
+
 
 # What the app told people earlier today, so that when NJ Transit posts the
 # track it can say whether the prediction held. In-process only: it resets when
@@ -491,7 +507,7 @@ def build_board(books, hist, token):
             "train": tid,
             "operator": ("Amtrak" if tid[:1] == "A" else "SEPTA" if tid[:1] == "S"
                          else "Non-revenue" if tid[:1] == "X" else "NJT"),
-            "line": item.get("LINE", ""),
+            "line": line_name(item),
             # NJ Transit's own line colour, stable per line regardless of
             # status (Amtrak's is the yellow one, and those rows are filtered out)
             "color": item.get("BACKCOLOR") or "",
@@ -664,6 +680,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 body{margin:0;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;
 font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
 .wrap{max-width:720px;margin:0 auto;padding:22px 16px 64px}
+.brand{text-align:center;font-size:24px;font-weight:600;letter-spacing:-.02em;margin:0 0 20px}
 h1{font-size:19px;font-weight:600;margin:0;letter-spacing:-.01em}
 .sub{color:var(--dim);font-size:13px;margin-top:2px}
 .tally{color:var(--faint);font-size:12px;margin:14px 0 10px}
@@ -715,14 +732,15 @@ border-radius:12px;margin-bottom:9px;padding:15px 17px 15px 14px}
 footer{margin-top:26px;font-size:12px;color:var(--faint);line-height:1.75}
 footer b{color:var(--dim);font-weight:500}
 </style></head><body><div class="wrap">
+<div class="brand">BeatTheBoard</div>
 <div class="hd">
-<div><h1>NY Penn</h1><div class="sub" id="sub">loading</div></div>
+<div><h1>NY Penn Station Departures</h1><div class="sub" id="sub">loading</div></div>
 </div>
 <div class="tally" id="tally"></div>
 <div id="err"></div>
 <div class="board" id="rows"></div>
 
-<h2>Live scorecard <span id="scorewhen"></span></h2>
+<h2>Report card <span id="scorewhen"></span></h2>
 <div class="sgrid" id="sgrid"></div>
 <div class="tokens" id="tokens"></div>
 
@@ -785,8 +803,9 @@ async function score(){
         '<div class="sn">Numbers appear once trains start posting.</div></div>';
       return;
     }
+    const us = d => d ? d.slice(5,7)+'-'+d.slice(8,10)+'-'+d.slice(0,4) : '';
     document.getElementById('scorewhen').textContent =
-      '\u00b7 '+s.days+(s.days===1?' day':' days')+' \u00b7 '+s.first_day+' to '+s.last_day;
+      '\u00b7 '+s.days+(s.days===1?' day':' days')+' \u00b7 '+us(s.first_day)+' to '+us(s.last_day);
     const m = v => (v===null||v===undefined)?'--':v+' min';
     const it = (k,v,n) => '<div class="sitem"><div class="sk">'+k+'</div><div class="sv">'+v+
       '</div><div class="sn">'+(n||'')+'</div></div>';

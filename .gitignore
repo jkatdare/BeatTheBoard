@@ -22,3 +22,6 @@ __pycache__/
 # scratch 
 _spec.txt
 containerapp.yaml
+stats.json
+synth_stats.json
+*.json.tmp
