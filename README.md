@@ -10,6 +10,13 @@ For each NJ Transit departure at Penn it shows one of three things:
 - a predicted track, with a confidence percentage
 - nothing, if it does not know
 
+Each row also says when the train departs and when it arrives, how many
+minutes before departure we called the track and how many minutes before NJ
+Transit posted it, and a warning triangle if there is a delay or an NJ
+Transit alert for that train or its line (tap it for the text). Type your
+stop in the box at the top to see only the trains that stop there, with the
+time they get there; the stop is remembered on your device.
+
 On held-out data it predicts about three quarters of departures, is right
 about 98% of the time when it does predict, and gets there a median of 13
 minutes before the official board. The board's own lead is about 10 minutes, so in

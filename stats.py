@@ -227,18 +227,19 @@ def record(conn, rows, now_iso, service_date):
 
 
 def memo_for(conn, service_date):
-    """train_id -> {track, predicted_at, unposted_at, posted_at} (epochs) for
-    today's predictions. Lets the confirmed badge survive a restart: without
-    this the app forgets what it predicted before the container came back."""
+    """train_id -> {track, predicted_at, unposted_at, posted_at, watched}
+    (epochs) for every train on record today, predicted or not. Lets the
+    badges and the per-train lead times survive a restart: without this the
+    app forgets what it saw before the container came back."""
     with _LOCK:
         return {tid: {"track": track,
                       "predicted_at": _iso_to_epoch(pa),
                       "unposted_at": _iso_to_epoch(ua),
-                      "posted_at": _iso_to_epoch(po)}
-                for tid, track, pa, ua, po in conn.execute(
-                    "SELECT train_id, predicted, predicted_at, unposted_at, posted_at "
-                    "FROM results WHERE service_date=? AND predicted IS NOT NULL",
-                    (service_date,))}
+                      "posted_at": _iso_to_epoch(po),
+                      "watched": 1 if watched is None else watched}
+                for tid, track, pa, ua, po, watched in conn.execute(
+                    "SELECT train_id, predicted, predicted_at, unposted_at, posted_at, "
+                    "watched FROM results WHERE service_date=?", (service_date,))}
 
 
 # ------------------------------------------------------------------- scorecard

@@ -28,6 +28,12 @@ still fetches on demand.
 Every snapshot is folded into stats.py, which records what was predicted and
 how it turned out, and serves the live scorecard at /api/stats.
 
+Three slower feeds ride along with the poll, each on its own timer: NJ
+Transit's rail alerts (getStationMSG, every ALERT_SECONDS) for the warning
+triangle, every train's stop list (getTrainSchedule, every STOPS_SECONDS) for
+the stop filter and arrival times, and the station list (getStationList, once
+a day) for the search box.
+
 Environment variables that matter for hosting:
     BIND         127.0.0.1 (default, this machine only) | 0.0.0.0 in a container
     PORT         8080
@@ -69,9 +75,10 @@ prior measured 15.6% (track) / 30.0% (platform) and is shown only as context.
 """
 
 import argparse
+import html
 import json
-import math
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -323,24 +330,6 @@ def load_history():
 
 # ---------------------------------------------------------------- predicting
 
-def platform_of(track):
-    try:
-        t = int(track)
-    except (TypeError, ValueError):
-        return None
-    return math.ceil(t / 2) if t <= 16 else None
-
-
-def where_to_wait(track):
-    """Tracks share an island in pairs (9 and 10 are one platform), so the
-    useful direction is which staircase -- not a platform number, which
-    confuses people when it does not match the track number."""
-    p = platform_of(track)
-    if not p:
-        return ""
-    return "Head for the Tracks %d-%d stairs" % (p * 2 - 1, p * 2)
-
-
 def now_eastern():
     """NJT times are US Eastern; the container clock is UTC. Prefer the tz
     database when present, else apply the US DST rule by hand (python:*-slim
@@ -405,22 +394,21 @@ def arrival(item, vehicle):
 def predict(item, books, circuits, hist):
     posted = (item.get("TRACK") or "").strip()
     if posted:
-        return {"track": posted, "tier": "official", "signal": None,
-                "confidence": None, "note": where_to_wait(posted)}
+        return {"track": posted, "tier": "official", "signal": None, "confidence": None}
 
     tid = str(item.get("TRAIN_ID") or "").strip()
     ckt = circuits.get(tid)
     hit = books["circuits"].get(ckt) if ckt else None
     if hit:
         return {"track": hit["track"], "tier": "predicted", "signal": "circuit",
-                "confidence": hit["purity"], "note": where_to_wait(hit["track"])}
+                "confidence": hit["purity"]}
 
     lat, lon = item.get("GPSLATITUDE"), item.get("GPSLONGITUDE")
     if lat and lon:
         hit = books["gps"].get(str(lat) + "," + str(lon))
         if hit:
             return {"track": hit["track"], "tier": "predicted", "signal": "berth",
-                    "confidence": hit["purity"], "note": where_to_wait(hit["track"])}
+                    "confidence": hit["purity"]}
 
     counter = hist.get(tid)
     if counter and sum(counter.values()) >= 4:
@@ -428,10 +416,8 @@ def predict(item, books, circuits, hist):
         top = counter.most_common(3)
         return {"track": None, "tier": "history", "signal": None,
                 "confidence": round(top[0][1] / total, 2),
-                "candidates": [{"track": t, "share": round(n / total, 2)} for t, n in top],
-                "note": "no live signal - historical tracks only"}
-    return {"track": None, "tier": "none", "signal": None, "confidence": None,
-            "note": "not yet posted"}
+                "candidates": [{"track": t, "share": round(n / total, 2)} for t, n in top]}
+    return {"track": None, "tier": "none", "signal": None, "confidence": None}
 
 
 # NJT train numbers are numeric. Letter prefixes are other operators sharing the
@@ -456,11 +442,163 @@ def line_name(item):
                           item.get("LINE") or "")
 
 
-# What the app told people earlier today -- (service_date, train) -> {track,
-# predicted_at, unposted_at, posted_at} in epoch seconds -- so that when NJ
-# Transit posts the track it can say whether the call held, and whether it was
-# early enough to count. Reloaded from the scorecard after every poll, so it
-# survives a restart.
+# ------------------------------------------------------ alerts, stops, stations
+
+def _clock(s, fmt="%m/%d/%Y %I:%M:%S %p"):
+    """'9/17/2026 6:23:50 PM' -> '6:23 PM' (or '' if unparsable)."""
+    try:
+        return datetime.strptime(str(s), fmt).strftime("%I:%M %p").lstrip("0")
+    except (TypeError, ValueError):
+        return ""
+
+
+# NJ Transit's rail alerts (the same feed as their website's advisories), for
+# the warning triangle. Refreshed on a timer; a failed refresh keeps the last
+# list rather than blanking every warning.
+ALERT_SECONDS = int(os.environ.get("ALERT_SECONDS", "60"))
+ALERTS = {"at": 0.0, "items": []}
+
+# An alert's line scope names lines in NJ Transit's own words ("*ME Line",
+# "*MontClair-Boonton Line"); map to the LINECODEs on the board. The Morris
+# & Essex covers both Morristown Line and Gladstone Branch trains. A blank
+# scope matches nothing: better a missed banner than a triangle on every row.
+LINE_SCOPES = (("northeast corridor", ("NE",)), ("coast", ("NC",)),
+               ("raritan", ("RV",)), ("montclair", ("MC",)), ("gladstone", ("GS",)),
+               ("morris", ("ME", "GS")), ("me line", ("ME", "GS")), ("m&e", ("ME", "GS")))
+_TRAIN_NO = re.compile(r"#\s*(\d{2,4})\b")
+
+
+def _scope_codes(scope):
+    codes = set()
+    for part in str(scope or "").split("*"):
+        p = part.strip().lower()
+        for needle, cs in LINE_SCOPES:
+            if p and needle in p:
+                codes.update(cs)
+    return codes
+
+
+def fetch_alerts(token):
+    rows = njt.api_post("getStationMSG", {"token": token, "station": njt.STATION, "line": ""})
+    out, seen = [], set()
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or r.get("MSG_ID") in seen:
+            continue
+        seen.add(r.get("MSG_ID"))
+        # their feed garbles its dashes into " ? " ("Track 4 Unavailable ? Weekends")
+        text = html.unescape(str(r.get("MSG_TEXT") or "")).replace(" ? ", " - ").strip()
+        if not text:
+            continue
+        m = _TRAIN_NO.search(text)
+        out.append({"text": text, "url": r.get("MSG_URL") or "",
+                    "when": _clock(r.get("MSG_PUBDATE")),
+                    # the first train named is the subject; later ones are the
+                    # alternatives riders are told to take
+                    "train": m.group(1) if m else None,
+                    "lines": _scope_codes(r.get("MSG_LINE_SCOPE"))})
+    return out
+
+
+def alerts_cached(token):
+    if time.time() - ALERTS["at"] >= ALERT_SECONDS:
+        ALERTS["at"] = time.time()
+        try:
+            ALERTS["items"] = fetch_alerts(token)
+        except Exception as e:
+            print("alerts: %s: %s" % (type(e).__name__, e))
+    return ALERTS["items"]
+
+
+def alerts_for(item, alerts):
+    """Delay and alert notes for one board row: its own status first, then NJ
+    Transit alerts naming this train, then alerts for its whole line. The
+    page shows the triangle for any of them and the first non-line note as
+    the reason."""
+    tid = str(item.get("TRAIN_ID") or "").strip()
+    code = str(item.get("LINECODE") or "").strip().upper()
+    status = str(item.get("STATUS") or "").strip().upper()
+    try:
+        late = int(float(item.get("SEC_LATE") or 0))
+    except ValueError:
+        late = 0
+    out = []
+    if "CANCEL" in status:
+        out.append({"scope": "status", "text": "canceled", "url": "", "when": ""})
+    elif late >= 300:
+        out.append({"scope": "status", "text": "running %d min late" % (late // 60),
+                    "url": "", "when": ""})
+    elif "DELAY" in status:
+        out.append({"scope": "status", "text": "delayed", "url": "", "when": ""})
+    msg = str(item.get("INLINEMSG") or "").strip()
+    if msg:
+        out.append({"scope": "train", "text": msg, "url": "", "when": ""})
+    for a in alerts:
+        if a["train"] == tid:
+            out.append({"scope": "train", "text": a["text"], "url": a["url"], "when": a["when"]})
+    for a in alerts:
+        if a["train"] is None and code in a["lines"]:
+            out.append({"scope": "line", "text": a["text"], "url": a["url"], "when": a["when"]})
+    return out
+
+
+# Every train's stop list, for the stop filter and arrival times. The 19Rec
+# board sends STOPS empty; the classic getTrainSchedule carries them, with
+# NJ Transit's current projection for each stop's time.
+STOPS_SECONDS = int(os.environ.get("STOPS_SECONDS", "60"))
+STOPS = {"at": 0.0, "by_train": {}}
+
+
+def fetch_stops(token):
+    payload = njt.api_post("getTrainSchedule", {"token": token, "station": njt.STATION})
+    out = {}
+    for item in njt.board_items(payload):
+        tid = str(item.get("TRAIN_ID") or "").strip()
+        stops = item.get("STOPS")
+        if not tid or not isinstance(stops, list):
+            continue
+        out[tid] = [{"code": str(s.get("STATION_2CHAR") or "").strip(),
+                     "name": str(s.get("STATIONNAME") or "").strip(),
+                     "time": _clock(s.get("TIME"), "%d-%b-%Y %I:%M:%S %p")}
+                    for s in stops if isinstance(s, dict)]
+    return out
+
+
+def stops_cached(token):
+    if time.time() - STOPS["at"] >= STOPS_SECONDS:
+        STOPS["at"] = time.time()
+        try:
+            STOPS["by_train"] = fetch_stops(token)
+        except Exception as e:
+            print("stops: %s: %s" % (type(e).__name__, e))
+    return STOPS["by_train"]
+
+
+# The station list behind the search box: fetched once a day.
+STATIONS = {"at": 0.0, "items": []}
+
+
+def stations_cached(token):
+    if STATIONS["items"] and time.time() - STATIONS["at"] < 86400:
+        return STATIONS["items"]
+    STATIONS["at"] = time.time()
+    try:
+        rows = njt.api_post("getStationList", {"token": token})
+        items = [{"code": str(r.get("STATION_2CHAR")).strip(),
+                  "name": str(r.get("STATIONNAME")).strip()}
+                 for r in rows if isinstance(r, dict)
+                 and r.get("STATION_2CHAR") and r.get("STATIONNAME")]
+        STATIONS["items"] = sorted(items, key=lambda s: s["name"].lower())
+    except Exception as e:
+        print("stations: %s: %s" % (type(e).__name__, e))
+    return STATIONS["items"]
+
+
+# What the app saw of every train today -- (service_date, train) -> {track we
+# called (or None), predicted_at, unposted_at, posted_at, watched} in epoch
+# seconds -- so that when NJ Transit posts the track it can say whether the
+# call held and whether it was early enough to count, and so each row can show
+# how far ahead of departure the call and the posting came. Reloaded from the
+# scorecard after every poll, so it survives a restart.
 MEMO = {}
 
 
@@ -482,25 +620,48 @@ def remember(tid, p, now=None):
     key = (service_date_eastern(), tid)
     m = MEMO.get(key)
     if p["tier"] == "official":
-        if m:
-            if m["track"] != p["track"]:
-                p["missed"] = m["track"]
-            elif (stats.proven_lead(m["predicted_at"], m.get("unposted_at"),
-                                    m.get("posted_at")) or 0) >= stats.MIN_LEAD:
-                p["tier"] = "verified"
-                p["confidence"] = 1.0
-            else:
-                p["late"] = True
+        if m is None:
+            # first seen already posted: no honest posting time, never a fair test
+            MEMO[key] = {"track": None, "predicted_at": None, "unposted_at": None,
+                         "posted_at": now, "watched": 0}
+        else:
+            if m.get("posted_at") is None:
+                m["posted_at"] = now
+            if m.get("track"):
+                if m["track"] != p["track"]:
+                    p["missed"] = m["track"]
+                elif (stats.proven_lead(m["predicted_at"], m.get("unposted_at"),
+                                        m.get("posted_at")) or 0) >= stats.MIN_LEAD:
+                    p["tier"] = "verified"
+                    p["confidence"] = 1.0
+                else:
+                    p["late"] = True
     else:
-        if p["tier"] == "predicted" and m is None:
-            m = MEMO[key] = {"track": p["track"], "predicted_at": now,
-                             "unposted_at": now, "posted_at": None}
-        if m and m.get("posted_at") is None:
+        if m is None:
+            m = MEMO[key] = {"track": None, "predicted_at": None, "unposted_at": now,
+                             "posted_at": None, "watched": 1}
+        if p["tier"] == "predicted" and not m.get("track"):
+            m["track"], m["predicted_at"] = p["track"], now
+        if m.get("posted_at") is None:
             m["unposted_at"] = now            # the board is still blank for this train
     if len(MEMO) > 1500:                      # keep today and yesterday only
         keep = {key[0], (now_eastern() - timedelta(days=1)).strftime("%Y-%m-%d")}
         for k in [k for k in MEMO if k[0] not in keep]:
             del MEMO[k]
+
+
+def leads_for(tid, depart_epoch):
+    """Minutes before the scheduled departure at which we called the track
+    (BTB) and at which NJ Transit posted it, or None for either. NJ Transit's
+    is only given when the posting was seen happen: a train first seen already
+    posted has no honest posting time."""
+    m = MEMO.get((service_date_eastern(), tid))
+    if not m or not depart_epoch:
+        return None, None
+    btb = int(round((depart_epoch - m["predicted_at"]) / 60)) if m.get("predicted_at") else None
+    njt_ = (int(round((depart_epoch - m["posted_at"]) / 60))
+            if m.get("posted_at") and m.get("watched", 1) else None)
+    return btb, njt_
 
 
 def build_board(books, hist, token):
@@ -511,6 +672,9 @@ def build_board(books, hist, token):
     # rows, higher assured limit.
     payload = njt.api_post("getTrainSchedule19Rec",
                            {"token": token, "station": njt.STATION, "line": ""})
+    alerts = alerts_cached(token)
+    stops = stops_cached(token)
+    stations_cached(token)
     rows = []
     for item in njt.board_items(payload):
         if NJT_ONLY and not str(item.get("TRAIN_ID", "")).strip().isdigit():
@@ -533,6 +697,8 @@ def build_board(books, hist, token):
         except (ValueError, TypeError):
             mins, dep_str, depart_epoch = None, sched or "", None
         tid = str(item.get("TRAIN_ID", ""))
+        lead_btb, lead_njt = leads_for(tid, depart_epoch)
+        tstops = stops.get(tid, [])
         rows.append({
             "train": tid,
             "operator": ("Amtrak" if tid[:1] == "A" else "SEPTA" if tid[:1] == "S"
@@ -550,6 +716,11 @@ def build_board(books, hist, token):
             "circuit": circuits.get(tid),
             "arrived": arrived,
             "at": at,
+            "stops": tstops,                             # [{code, name, time}], NY first
+            "arrives": tstops[-1]["time"] if tstops else "",
+            "alerts": alerts_for(item, alerts),
+            "lead_btb": lead_btb,                        # minutes before departure we called it
+            "lead_njt": lead_njt,                        # minutes before departure NJT posted it
             "prediction": p,
         })
     return {"station": "New York Penn Station",
@@ -693,6 +864,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+        elif self.path.startswith("/api/stations"):
+            body = json.dumps({"stations": STATIONS["items"]})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "max-age=3600")
         elif self.path.startswith("/health"):
             body = "ok"
             self.send_response(200)
@@ -722,9 +898,23 @@ font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-
 .brand{text-align:center;font-size:24px;font-weight:600;letter-spacing:-.02em;margin:0 0 20px}
 h1{font-size:19px;font-weight:600;margin:0;letter-spacing:-.01em}
 .sub{color:var(--dim);font-size:13px;margin-top:2px}
+.find{position:relative;margin:16px 0 0}
+.find input{width:100%;font:inherit;font-size:15px;padding:10px 40px 10px 12px;border:1px solid var(--line);
+border-radius:10px;background:var(--card);color:var(--fg);outline:none}
+.find input:focus{border-color:var(--faint)}
+.find button{position:absolute;right:5px;top:5px;width:32px;height:32px;border:none;background:transparent;
+color:var(--faint);font-size:22px;line-height:1;cursor:pointer;border-radius:8px}
+.find button:hover{background:var(--line);color:var(--fg)}
+.menu{position:absolute;left:0;right:0;top:100%;z-index:5;background:var(--card);border:1px solid var(--line);
+border-radius:10px;margin-top:4px;box-shadow:0 8px 24px rgba(0,0,0,.14);overflow:hidden}
+.menu:empty{display:none}
+.opt{padding:9px 12px;font-size:14px;cursor:pointer}
+.opt:hover{background:var(--bg)}
 .tally{color:var(--faint);font-size:12px;margin:14px 0 10px}
 .err{background:var(--warnbg);color:var(--warn);padding:10px 12px;border-radius:8px;
 font-size:13px;margin-bottom:12px}
+.empty{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;
+color:var(--dim);font-size:14px}
 .board{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
 .row{display:flex;align-items:center;gap:14px;padding:13px 16px 13px 13px;
 border-bottom:1px solid var(--line);border-left:4px solid transparent}
@@ -732,9 +922,15 @@ border-bottom:1px solid var(--line);border-left:4px solid transparent}
 .main{flex:1;min-width:0}
 .dest{font-size:15px;font-weight:500;letter-spacing:-.01em;white-space:nowrap;
 overflow:hidden;text-overflow:ellipsis}
+.alert{color:var(--warn);cursor:pointer;margin-left:7px;font-size:15px}
 .meta{font-size:12.5px;color:var(--dim);margin-top:2px}
 .note{font-size:12px;color:var(--faint);margin-top:3px}
-.miss{font-size:12px;color:var(--warn);margin-top:3px}
+.miss,.warnline{font-size:12px;color:var(--warn);margin-top:3px}
+.alerts{font-size:12px;color:var(--dim);margin-top:6px;padding:8px 10px;background:var(--warnbg);
+border-radius:8px;white-space:normal}
+.alerts div+div{margin-top:5px}
+.alerts a{color:inherit}
+.faint{color:var(--faint)}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;
 vertical-align:1px;background:var(--faint)}
 .dot.on{background:var(--ok)}
@@ -775,6 +971,11 @@ footer b{color:var(--dim);font-weight:500}
 <div class="hd">
 <div><h1>NY Penn Station Departures</h1><div class="sub" id="sub">loading</div></div>
 </div>
+<div class="find">
+<input id="stop" type="text" placeholder="Your stop - start typing, e.g. Summit" autocomplete="off" spellcheck="false" aria-label="Your stop">
+<button id="clear" type="button" title="Show all trains" aria-label="Show all trains">&times;</button>
+<div class="menu" id="menu"></div>
+</div>
 <div class="tally" id="tally"></div>
 <div id="err"></div>
 <div class="board" id="rows"></div>
@@ -787,11 +988,106 @@ footer b{color:var(--dim);font-weight:500}
 <div><b>confirmed</b> - we called it at least __MIN_LEAD__ s before NJ Transit posted the same track. Closer than that is not counted as beating the board.</div>
 <div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it. Capped at 99%: without their announcement it is never certain.</div>
 <div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, we called it too late to count, or we got it wrong - and it says so underneath.</div>
+<div><b>BTB +x mins</b> - how long before the scheduled departure we called the track. <b>NJT +x mins</b> - how long before departure NJ Transit posted it.</div>
+<div><b>\u26a0\ufe0e</b> - a delay, or an NJ Transit alert for this train or its whole line. Tap it for the details.</div>
 <div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
-<div>The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
+<div>Type your stop above to see only the trains that stop there, with the time they get there. It is remembered on this device. The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
 <script>
-function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+let STATIONS = [], STOP = null, BOARD = null;
+const OPEN = new Set();                       // trains whose alert details are expanded
+const inp = document.getElementById('stop'), menu = document.getElementById('menu');
+// the home stop is remembered on this device
+try{ STOP = JSON.parse(localStorage.getItem('btb-stop') || 'null'); }catch(e){ STOP = null; }
+if(STOP && STOP.code && STOP.name) inp.value = STOP.name; else STOP = null;
+fetch('/api/stations').then(r=>r.json()).then(s=>{ STATIONS = s.stations || []; }).catch(e=>{});
+
+function setStop(s){
+  STOP = s; inp.value = s ? s.name : ''; menu.innerHTML = '';
+  try{ if(s) localStorage.setItem('btb-stop', JSON.stringify(s)); else localStorage.removeItem('btb-stop'); }catch(e){}
+  render();
+}
+function matches(q){
+  q = q.trim().toLowerCase(); if(!q) return [];
+  const pre = STATIONS.filter(s=>s.name.toLowerCase().startsWith(q));
+  const mid = STATIONS.filter(s=>!s.name.toLowerCase().startsWith(q) && s.name.toLowerCase().includes(q));
+  return pre.concat(mid).slice(0, 12);
+}
+function showMenu(){
+  menu.innerHTML = matches(inp.value).map(s=>'<div class="opt" data-code="'+esc(s.code)+'">'+esc(s.name)+'</div>').join('');
+}
+inp.addEventListener('input', ()=>{ showMenu(); if(!inp.value.trim() && STOP) setStop(null); });
+inp.addEventListener('focus', showMenu);
+inp.addEventListener('keydown', e=>{
+  if(e.key==='Enter'){ const m = matches(inp.value); if(m.length) setStop(m[0]); inp.blur(); e.preventDefault(); }
+  else if(e.key==='Escape'){ menu.innerHTML = ''; inp.blur(); }
+});
+menu.addEventListener('pointerdown', e=>{
+  const o = e.target.closest('.opt'); if(!o) return; e.preventDefault();
+  setStop(STATIONS.find(s=>s.code===o.dataset.code) || null); inp.blur();
+});
+document.addEventListener('click', e=>{ if(!e.target.closest('.find')) menu.innerHTML = ''; });
+document.getElementById('clear').addEventListener('click', ()=>{ setStop(null); inp.focus(); });
+document.getElementById('rows').addEventListener('click', e=>{
+  const a = e.target.closest('.alert'); if(!a) return;
+  const id = a.dataset.train; if(OPEN.has(id)) OPEN.delete(id); else OPEN.add(id); render();
+});
+
+const unit = n => Math.abs(n)===1 ? 'min' : 'mins';
+const signed = n => (n>=0?'+':'')+n;
+function render(){
+  if(!BOARD) return;
+  const b = BOARD;
+  document.getElementById('sub').textContent = 'updated ' + b.fetched_at;
+  // a train whose stop list has not loaded yet is kept rather than hidden
+  const list = STOP ? b.trains.filter(t => !(t.stops && t.stops.length) || t.stops.some(s=>s.code===STOP.code)) : b.trains;
+  let off=0,pred=0,none=0;
+  list.forEach(t=>{const k=t.prediction.tier;
+    if(k==='official'||k==='verified')off++; else if(k==='predicted')pred++; else none++;});
+  document.getElementById('tally').textContent =
+    list.length+(list.length===1?' train':' trains')+(STOP?' to '+STOP.name:'')+
+    ' \u00b7 '+off+' on the board \u00b7 '+pred+' predicted \u00b7 '+none+' waiting';
+  if(!list.length){
+    document.getElementById('rows').innerHTML = '<div class="empty">No trains to '+esc(STOP.name)+' on the board right now.</div>';
+    return;
+  }
+  document.getElementById('rows').innerHTML = list.map(t=>{
+    const p=t.prediction; let num='--', ncls='off', tier='', tcls='off', extra='';
+    const al = t.alerts || [];
+    const prob = al.find(a=>a.scope!=='line');
+    if(prob) extra += '<div class="warnline">'+esc(prob.text)+'</div>';
+    const lead = [];
+    if(t.lead_btb!==null && t.lead_btb!==undefined) lead.push('BTB '+signed(t.lead_btb)+' '+unit(t.lead_btb));
+    if(t.lead_njt!==null && t.lead_njt!==undefined) lead.push('NJT '+signed(t.lead_njt)+' '+unit(t.lead_njt));
+    else if(lead.length && p.tier!=='official' && p.tier!=='verified') lead.push('NJT not posted yet');
+    if(lead.length) extra += '<div class="note">'+lead.join(' \u00b7 ')+'</div>';
+    if(p.tier==='verified'){ num=p.track; ncls='ok'; tcls='ok'; tier='confirmed'; }
+    else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
+      if(p.missed) extra+='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>';
+      else if(p.late) extra+='<div class="cand">we called it too, but under __MIN_LEAD__ s before NJ Transit did - not counted</div>'; }
+    else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
+      tier='predicted'+(p.confidence?' '+Math.min(99,Math.round(p.confidence*100))+'%':''); }
+    else if(p.tier==='history'){ tcls='off'; tier='no signal';
+      extra+='<div class="cand">usually '+p.candidates.map(c=>esc(c.track)+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>'; }
+    else { tier='not posted'; }
+    if(al.length) extra += '<div class="alerts"'+(OPEN.has(t.train)?'':' hidden')+'>'+al.map(a=>'<div>'+esc(a.text)+
+      (a.when?' <span class="faint">\u00b7 posted '+esc(a.when)+'</span>':'')+
+      (a.url?' <a href="'+esc(a.url)+'" target="_blank" rel="noopener">details</a>':'')+'</div>').join('')+'</div>';
+    const mins = t.minutes===null?'':(t.minutes<=0?'now':'in '+t.minutes+' min');
+    let arr = '';
+    if(STOP){ const s=(t.stops||[]).find(s=>s.code===STOP.code); if(s && s.time) arr='arrives '+esc(STOP.name)+' at '+esc(s.time); }
+    else if(t.arrives) arr = 'arrives at '+esc(t.arrives);
+    const meta = [esc(t.line), t.depart?'departs at '+esc(t.depart):'', mins, arr].filter(Boolean).join(' \u00b7 ');
+    const icon = al.length ? '<span class="alert" data-train="'+esc(t.train)+'" title="Delay or alert - tap for details">\u26a0\ufe0e</span>' : '';
+    return '<div class="row" style="border-left-color:'+(esc(t.color)||'transparent')+'">'+
+      '<div class="main"><div class="dest">'+esc(t.destination)+icon+'</div>'+
+      '<div class="meta"><span class="dot'+(t.arrived?' on':'')+'"></span>'+meta+'</div>'+
+      extra+'</div>'+
+      '<div class="right"><div class="trk '+ncls+'">'+esc(num)+'</div>'+
+      '<div class="tier '+tcls+'">'+esc(tier)+'</div></div></div>';
+  }).join('');
+}
 let due = __TICK_MS__;   // ms until the next board fetch
 async function tick(){
   try{
@@ -801,35 +1097,7 @@ async function tick(){
     // late or asleep (quiet hours), fall back to a plain interval.
     due = (d.poll > 0 && d.age < d.poll) ? Math.max(400, (d.poll - d.age) * 1000 + 500) : __TICK_MS__;
     document.getElementById('err').innerHTML = d.error ? '<div class="err">'+esc(d.error)+'</div>' : '';
-    if(!d.board){return;}
-    const b = d.board;
-    document.getElementById('sub').textContent = 'updated ' + b.fetched_at;
-    let off=0,pred=0,none=0;
-    b.trains.forEach(t=>{const k=t.prediction.tier;
-      if(k==='official'||k==='verified')off++; else if(k==='predicted')pred++; else none++;});
-    document.getElementById('tally').textContent =
-      b.trains.length+' trains \u00b7 '+off+' on the board \u00b7 '+pred+' predicted \u00b7 '+none+' waiting';
-    document.getElementById('rows').innerHTML = b.trains.map(t=>{
-      const p=t.prediction; let num='--', ncls='off', tier='', tcls='off', extra='';
-      if(p.tier==='verified'){ num=p.track; ncls='ok'; tcls='ok'; tier='confirmed'; }
-      else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
-        if(p.missed) extra='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>';
-        else if(p.late) extra='<div class="cand">we called it too, but under __MIN_LEAD__ s before NJ Transit did - not counted</div>'; }
-      else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
-        tier='predicted'+(p.confidence?' '+Math.min(99,Math.round(p.confidence*100))+'%':''); }
-      else if(p.tier==='history'){ tcls='off'; tier='no signal';
-        extra='<div class="cand">usually '+p.candidates.map(c=>esc(c.track)+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>'; }
-      else { tier='not posted'; }
-      if(p.track && p.note) extra = '<div class="note">'+esc(p.note)+'</div>' + extra;
-      const mins = t.minutes===null?'':(t.minutes<=0?'now':'in '+t.minutes+' min');
-      const meta = [esc(t.line), esc(t.depart), mins].filter(Boolean).join(' \u00b7 ');
-      return '<div class="row" style="border-left-color:'+(esc(t.color)||'transparent')+'">'+
-        '<div class="main"><div class="dest">'+esc(t.destination)+'</div>'+
-        '<div class="meta"><span class="dot'+(t.arrived?' on':'')+'"></span>'+meta+'</div>'+
-        extra+'</div>'+
-        '<div class="right"><div class="trk '+ncls+'">'+esc(num)+'</div>'+
-        '<div class="tier '+tcls+'">'+esc(tier)+'</div></div></div>';
-    }).join('');
+    if(d.board){ BOARD = d.board; render(); }
   }catch(e){ due = __TICK_MS__; }
   finally{ setTimeout(tick, due); }
 }
@@ -841,7 +1109,7 @@ async function score(){
       const used = s.tokens.used, lim = s.tokens.limit || 10;
       tk.className = 'tokens' + (used >= lim - 3 ? ' warn' : '');
       tk.innerHTML = 'API tokens minted today <b>' + used + ' / ' + lim + '</b>' +
-        (used >= lim ? ' · limit reached, predictions resume after midnight' : '');
+        (used >= lim ? ' \u00b7 limit reached, predictions resume after midnight' : '');
     } else { tk.textContent = ''; }
     const g = document.getElementById('sgrid');
     if(!s.scored){
