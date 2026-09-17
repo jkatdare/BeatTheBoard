@@ -34,7 +34,10 @@ Environment variables that matter for hosting:
     STATS_DB     where the scorecard lives. In the container this must point at
                  a mounted volume (see setup_storage.py) -- a container
                  filesystem is ephemeral and would reset on every deploy.
-    POLL_SECONDS 0 disables the poller and falls back to fetching per request.
+    POLL_SECONDS how often the poller asks NJT (default 5); 0 disables it and
+                 falls back to fetching per request.
+    CACHE_SECONDS how long a request serves the last board (default: the poll
+                 interval, so requests never fetch while the poller is alive).
 
 How it predicts
 ---------------
@@ -86,13 +89,25 @@ CODEBOOK_PATH = "codebook.json"
 
 BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
-CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "20"))
-
 # The poller keeps the scorecard filling without anyone visiting the page.
 # It is only viable because a warm replica is kept running; under
 # scale-to-zero there would be no process alive to run it. Set to 0 to
 # disable and go back to fetching only when a request arrives.
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
+#
+# How fast it can go is set by NJ Transit, not by Azure. Each poll is two
+# calls (board + vehicles) and each method allows 40,000 a day, so over the
+# 22 hours a day the poller runs, 2 s is the absolute floor and 5 s leaves
+# room for restarts and local test runs (about 40% of the quota). Their
+# feeds move every 1-2 s, so the poll rate is what a rider notices. On Azure
+# the replica is billed for its allocated 0.25 vCPU every second it runs --
+# at the active rate once it receives more than 1 KB/s, which any poll
+# faster than ~25 s already does -- so the rate itself costs nothing extra.
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))
+
+# How long a request serves the last board before fetching a fresh one.
+# While the poller runs, requests should never need to fetch, so this
+# defaults to the poll interval; without the poller, 20 s.
+CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "0")) or (POLL_SECONDS or 20)
 
 # No NJ Transit departures from Penn in the small hours, so the poller
 # sleeps through them. Requests are still served if anyone does visit.
@@ -441,10 +456,11 @@ def line_name(item):
                           item.get("LINE") or "")
 
 
-# What the app told people earlier today, so that when NJ Transit posts the
-# track it can say whether the prediction held. In-process only: it resets when
-# the container restarts (scale-to-zero), after which already-posted trains just
-# show as official until the next prediction is made.
+# What the app told people earlier today -- (service_date, train) -> {track,
+# predicted_at, unposted_at, posted_at} in epoch seconds -- so that when NJ
+# Transit posts the track it can say whether the call held, and whether it was
+# early enough to count. Reloaded from the scorecard after every poll, so it
+# survives a restart.
 MEMO = {}
 
 
@@ -455,18 +471,32 @@ def service_date_eastern():
     return d.strftime("%Y-%m-%d")
 
 
-def remember(tid, p):
-    """Record first predictions; turn a matching official posting into
-    'verified' (100%), or flag the earlier prediction on a miss."""
+def remember(tid, p, now=None):
+    """Record first predictions; when NJ Transit posts, turn a matching call
+    into 'verified' (100%) -- but only if it was provably showing at least
+    stats.MIN_LEAD seconds before the posting, measured to the last poll at
+    which the board was still blank (stats.proven_lead). A matching call
+    closer than that is marked late and stays 'official', earning no credit;
+    a wrong call is flagged whatever its timing."""
+    now = now or time.time()
     key = (service_date_eastern(), tid)
-    if p["tier"] == "predicted":
-        MEMO.setdefault(key, p["track"])
-    elif p["tier"] == "official" and key in MEMO:
-        if MEMO[key] == p["track"]:
-            p["tier"] = "verified"
-            p["confidence"] = 1.0
-        else:
-            p["missed"] = MEMO[key]
+    m = MEMO.get(key)
+    if p["tier"] == "official":
+        if m:
+            if m["track"] != p["track"]:
+                p["missed"] = m["track"]
+            elif (stats.proven_lead(m["predicted_at"], m.get("unposted_at"),
+                                    m.get("posted_at")) or 0) >= stats.MIN_LEAD:
+                p["tier"] = "verified"
+                p["confidence"] = 1.0
+            else:
+                p["late"] = True
+    else:
+        if p["tier"] == "predicted" and m is None:
+            m = MEMO[key] = {"track": p["track"], "predicted_at": now,
+                             "unposted_at": now, "posted_at": None}
+        if m and m.get("posted_at") is None:
+            m["unposted_at"] = now            # the board is still blank for this train
     if len(MEMO) > 1500:                      # keep today and yesterday only
         keep = {key[0], (now_eastern() - timedelta(days=1)).strftime("%Y-%m-%d")}
         for k in [k for k in MEMO if k[0] not in keep]:
@@ -537,13 +567,17 @@ BOOKS, HIST = None, None
 STATS = None                      # sqlite connection, opened in main()
 
 
-def get_board():
+def get_board(force=False):
+    """force: fetch even if the cache is fresh. The poller runs on its own
+    clock -- its cycle starts when a fetch begins, the cache's age when one
+    ends -- so without this it woke just inside the cache window, skipped,
+    and polled at half the rate. The quota hold below still applies."""
     with CACHE_LOCK:
         age = time.time() - CACHE["at"]
-        if CACHE["board"] is not None and age < CACHE_SECONDS:
-            return CACHE["board"], CACHE["error"], round(age)
+        if not force and CACHE["board"] is not None and age < CACHE_SECONDS:
+            return CACHE["board"], CACHE["error"], round(age, 1)
         if time.time() < CACHE.get("hold_until", 0):
-            return CACHE["board"], CACHE["error"], round(age)
+            return CACHE["board"], CACHE["error"], round(age, 1)
         for attempt in (1, 2):
             try:
                 if not CACHE["token"]:
@@ -625,12 +659,14 @@ def in_quiet_hours():
 
 def poller():
     while True:
+        started = time.time()
         if not in_quiet_hours():
             try:
-                get_board()
+                get_board(force=True)
             except Exception as e:
                 print("poller: %s: %s" % (type(e).__name__, e))
-        time.sleep(POLL_SECONDS)
+        # a steady cadence: the fetch itself takes a second or so
+        time.sleep(max(0.5, POLL_SECONDS - (time.time() - started)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -640,7 +676,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/board"):
             board, error, age = get_board()
-            body = json.dumps({"board": board, "error": error, "age": age})
+            # poll + age let the page time its next request to land just
+            # after the poller's next fetch: one request per poll, no lag
+            body = json.dumps({"board": board, "error": error, "age": age,
+                               "poll": POLL_SECONDS})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -745,17 +784,22 @@ footer b{color:var(--dim);font-weight:500}
 <div class="tokens" id="tokens"></div>
 
 <footer>
-<div><b>confirmed</b> - we called it early, then NJ Transit posted the same track.</div>
+<div><b>confirmed</b> - we called it at least __MIN_LEAD__ s before NJ Transit posted the same track. Closer than that is not counted as beating the board.</div>
 <div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it. Capped at 99%: without their announcement it is never certain.</div>
-<div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, or we got it wrong - and if we got it wrong, it says so underneath.</div>
+<div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, we called it too late to count, or we got it wrong - and it says so underneath.</div>
 <div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
 <div>The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
 <script>
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+let due = __TICK_MS__;   // ms until the next board fetch
 async function tick(){
   try{
     const d = await (await fetch('/api/board')).json();
+    // ask again just after the poller's next fetch lands: each poll shows
+    // within about half a second, at one request per poll. If the poller is
+    // late or asleep (quiet hours), fall back to a plain interval.
+    due = (d.poll > 0 && d.age < d.poll) ? Math.max(400, (d.poll - d.age) * 1000 + 500) : __TICK_MS__;
     document.getElementById('err').innerHTML = d.error ? '<div class="err">'+esc(d.error)+'</div>' : '';
     if(!d.board){return;}
     const b = d.board;
@@ -769,7 +813,8 @@ async function tick(){
       const p=t.prediction; let num='--', ncls='off', tier='', tcls='off', extra='';
       if(p.tier==='verified'){ num=p.track; ncls='ok'; tcls='ok'; tier='confirmed'; }
       else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
-        if(p.missed) extra='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>'; }
+        if(p.missed) extra='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>';
+        else if(p.late) extra='<div class="cand">we called it too, but under __MIN_LEAD__ s before NJ Transit did - not counted</div>'; }
       else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
         tier='predicted'+(p.confidence?' '+Math.min(99,Math.round(p.confidence*100))+'%':''); }
       else if(p.tier==='history'){ tcls='off'; tier='no signal';
@@ -785,7 +830,8 @@ async function tick(){
         '<div class="right"><div class="trk '+ncls+'">'+esc(num)+'</div>'+
         '<div class="tier '+tcls+'">'+esc(tier)+'</div></div></div>';
     }).join('');
-  }catch(e){}
+  }catch(e){ due = __TICK_MS__; }
+  finally{ setTimeout(tick, due); }
 }
 async function score(){
   try{
@@ -810,16 +856,22 @@ async function score(){
     const it = (k,v,n) => '<div class="sitem"><div class="sk">'+k+'</div><div class="sv">'+v+
       '</div><div class="sn">'+(n||'')+'</div></div>';
     g.innerHTML =
-      it('Coverage', s.coverage+'%', s.predicted+' of '+s.scored+' trains predicted') +
+      it('Coverage', s.coverage+'%', s.predicted+' of '+s.scored+' trains called '+s.min_lead+'+ s before the board'+
+         (s.late ? ' \u00b7 '+s.late+' called too late to count' : '')) +
       it('Accuracy', s.accuracy===null?'--':s.accuracy+'%',
          s.correct+' of '+s.predicted+' predictions correct') +
       it('BeatTheBoard', m(s.ours_median), 'median before departure \u00b7 mean '+m(s.ours_mean)) +
       it('NJ Transit board', m(s.njt_median), 'median before departure \u00b7 mean '+m(s.njt_mean));
   }catch(e){}
 }
-tick(); setInterval(tick, 15000);
-score(); setInterval(score, 60000);
+tick();
+score(); setInterval(score, 30000);
 </script></body></html>"""
+
+# __TICK_MS__ is the page's fallback interval; normally it times itself to
+# the poller (see tick() in the script above).
+PAGE = (PAGE.replace("__TICK_MS__", str(max(2, POLL_SECONDS or 15) * 1000))
+            .replace("__MIN_LEAD__", str(stats.MIN_LEAD)))
 
 
 def main():

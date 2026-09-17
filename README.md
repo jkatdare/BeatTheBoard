@@ -10,9 +10,9 @@ For each NJ Transit departure at Penn it shows one of three things:
 - a predicted track, with a confidence percentage
 - nothing, if it does not know
 
-On held-out data it predicts about two thirds of departures, is right about
-98% of the time when it does predict, and gets there a median of 13 minutes
-before the official board. The board's own lead is about 10 minutes, so in
+On held-out data it predicts about three quarters of departures, is right
+about 98% of the time when it does predict, and gets there a median of 13
+minutes before the official board. The board's own lead is about 10 minutes, so in
 practice you know roughly 20 to 25 minutes before departure. It says nothing
 rather than guess.
 
@@ -62,10 +62,12 @@ Things I tried that did not work, in case you are thinking of them:
 
 Everything is standard library Python. There is nothing to install.
 
-- engine.py: the web app. Fetches the board and vehicle feed from NJ Transit
-  when a request comes in, decodes the two signals, and serves the page. The
-  result is cached for 20 seconds so refreshing does not hammer the API.
-  Also builds codebook.json from collected data with --rebuild.
+- engine.py: the web app. A background poller fetches the board and vehicle
+  feed from NJ Transit every 5 seconds, decodes the two signals, and serves
+  the page from that snapshot. It also keeps the report card on the page: a
+  prediction only counts if it was showing at least 30 seconds before NJ
+  Transit posted the track. Also builds codebook.json from collected data
+  with --rebuild.
 - njt_logger.py: shared API client (token handling, the multipart POST format
   the API requires) plus the original data logger that records the board and
   vehicle feed to a local database. Only needed to grow the codebook.
