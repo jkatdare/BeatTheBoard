@@ -13,7 +13,9 @@ For each NJ Transit departure at Penn it shows one of three things:
 Each row also says when the train departs and when it arrives, how many
 minutes before departure we called the track and how many minutes before NJ
 Transit posted it, and a warning triangle if there is a delay or an NJ
-Transit alert for that train or its line (tap it for the text). Type your
+Transit alert for that train or its line. Tap it to see whether that
+particular train is on time, late, canceled or making extra stops, with the
+full alert text. Type your
 stop in the box at the top to see only the trains that stop there, with the
 time they get there; the stop is remembered on your device.
 

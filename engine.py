@@ -541,6 +541,61 @@ def alerts_for(item, alerts):
     return out
 
 
+_MIN_LATE = re.compile(r"(up to\s+)?(\d{1,3})\s*(?:min(?:ute)?s?\.?)\s+late", re.I)
+
+
+def decode_alert(text):
+    """Short labels read out of an NJ Transit alert about one train:
+    'Delayed up to 15 min', 'Canceled', 'Making additional stops', ...
+    Free text, so this is best effort; the popup shows the full message too."""
+    t = text.lower()
+    labels = []
+    if re.search(r"\bcancel", t):
+        labels.append("Canceled")
+    m = _MIN_LATE.search(text)
+    if m:
+        labels.append(("Delayed up to %s min" if m.group(1) else "Delayed %s min") % m.group(2))
+    elif not labels and re.search(r"\bdelay|\blate\b", t):
+        labels.append("Delayed")
+    if re.search(r"all (?:local )?stops|additional stop|extra stop|also stop|will (?:also )?stop at", t):
+        labels.append("Making additional stops")
+    if re.search(r"will not stop|not stopping|skip|operat\w* express", t):
+        labels.append("Skipping stops")
+    if not labels and re.search(r"will operate|has been restored|is operating|resumed", t):
+        labels.append("Operating as scheduled")
+    return labels
+
+
+def train_state(item, notes):
+    """One-line state of THIS train for the popup, from the board row and the
+    alerts that name the train -- so on a line with an alert a rider can
+    still see whether their own train is on time, late, or making extra
+    stops. Line-wide alerts are not folded in: they may not apply to every
+    train, and the popup lists them separately."""
+    status = str(item.get("STATUS") or "").strip().upper()
+    try:
+        late = int(float(item.get("SEC_LATE") or 0))
+    except ValueError:
+        late = 0
+    labels = []
+    if "CANCEL" in status:
+        labels.append("Canceled")
+    if late >= 60:
+        labels.append("Running %d min late" % (late // 60))
+    elif "DELAY" in status:
+        labels.append("Delayed")
+    for n in notes:
+        if n["scope"] == "train":
+            labels += decode_alert(n["text"])
+    out = []
+    for l in labels:                      # keep order, drop repeats
+        if l not in out:
+            out.append(l)
+    if any(l.startswith("Delayed ") or l.startswith("Running") for l in out):
+        out = [l for l in out if l != "Delayed"]     # a figure beats a bare word
+    return out or ["On time"]
+
+
 # Every train's stop list, for the stop filter and arrival times. The 19Rec
 # board sends STOPS empty; the classic getTrainSchedule carries them, with
 # NJ Transit's current projection for each stop's time.
@@ -699,6 +754,7 @@ def build_board(books, hist, token):
         tid = str(item.get("TRAIN_ID", ""))
         lead_btb, lead_njt = leads_for(tid, depart_epoch)
         tstops = stops.get(tid, [])
+        notes = alerts_for(item, alerts)
         rows.append({
             "train": tid,
             "operator": ("Amtrak" if tid[:1] == "A" else "SEPTA" if tid[:1] == "S"
@@ -718,7 +774,8 @@ def build_board(books, hist, token):
             "at": at,
             "stops": tstops,                             # [{code, name, time}], NY first
             "arrives": tstops[-1]["time"] if tstops else "",
-            "alerts": alerts_for(item, alerts),
+            "alerts": notes,
+            "state": train_state(item, notes),           # ["On time"] / ["Delayed up to 15 min", ...]
             "lead_btb": lead_btb,                        # minutes before departure we called it
             "lead_njt": lead_njt,                        # minutes before departure NJT posted it
             "prediction": p,
@@ -931,6 +988,23 @@ border-radius:8px;white-space:normal}
 .alerts div+div{margin-top:5px}
 .alerts a{color:inherit}
 .faint{color:var(--faint)}
+.modal{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.45);display:flex;
+align-items:center;justify-content:center;padding:16px}
+.modal[hidden]{display:none}
+.mbox{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:14px;
+max-width:480px;width:100%;max-height:85vh;overflow:auto;padding:16px 18px 18px;
+box-shadow:0 16px 48px rgba(0,0,0,.3)}
+.mhead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;
+font-size:16px;font-weight:600;line-height:1.35}
+.mhead button{border:none;background:transparent;color:var(--faint);font-size:26px;line-height:1;
+cursor:pointer;padding:0 2px;flex-shrink:0}
+.mstate{font-size:15px;font-weight:600;color:var(--ok);margin:10px 0 2px}
+.mstate.bad{color:var(--warn)}
+.mh{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);
+margin:14px 0 2px}
+.mmsg{font-size:13px;color:var(--dim);line-height:1.5;padding:8px 10px;background:var(--bg);
+border-radius:8px;margin-top:6px}
+.mmsg a{color:inherit}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;
 vertical-align:1px;background:var(--faint)}
 .dot.on{background:var(--ok)}
@@ -989,14 +1063,18 @@ footer b{color:var(--dim);font-weight:500}
 <div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it. Capped at 99%: without their announcement it is never certain.</div>
 <div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, we called it too late to count, or we got it wrong - and it says so underneath.</div>
 <div><b>BTB +x mins</b> - how long before the scheduled departure we called the track. <b>NJT +x mins</b> - how long before departure NJ Transit posted it.</div>
-<div><b>\u26a0\ufe0e</b> - a delay, or an NJ Transit alert for this train or its whole line. Tap it for the details.</div>
+<div><b>\u26a0\ufe0e</b> - a delay, or an NJ Transit alert for this train or its whole line. Tap it to see whether this particular train is on time, late, canceled or making extra stops, and the full alert text.</div>
 <div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
 <div>Type your stop above to see only the trains that stop there, with the time they get there. It is remembered on this device. The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
+<div class="modal" id="modal" hidden><div class="mbox">
+<div class="mhead"><div id="mtitle"></div><button id="mclose" type="button" aria-label="Close">&times;</button></div>
+<div id="mbody"></div>
+</div></div>
 <script>
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 let STATIONS = [], STOP = null, BOARD = null;
-const OPEN = new Set();                       // trains whose alert details are expanded
+let MODAL = null;                             // train whose warning popup is open
 const inp = document.getElementById('stop'), menu = document.getElementById('menu');
 // the home stop is remembered on this device
 try{ STOP = JSON.parse(localStorage.getItem('btb-stop') || 'null'); }catch(e){ STOP = null; }
@@ -1031,8 +1109,32 @@ document.addEventListener('click', e=>{ if(!e.target.closest('.find')) menu.inne
 document.getElementById('clear').addEventListener('click', ()=>{ setStop(null); inp.focus(); });
 document.getElementById('rows').addEventListener('click', e=>{
   const a = e.target.closest('.alert'); if(!a) return;
-  const id = a.dataset.train; if(OPEN.has(id)) OPEN.delete(id); else OPEN.add(id); render();
+  MODAL = a.dataset.train; renderModal();
 });
+const modal = document.getElementById('modal');
+function closeModal(){ MODAL = null; modal.hidden = true; }
+modal.addEventListener('click', e=>{ if(e.target === modal || e.target.closest('#mclose')) closeModal(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && MODAL) closeModal(); });
+// the popup is rebuilt from the latest board on every poll while it is open
+function renderModal(){
+  if(!MODAL || !BOARD){ modal.hidden = true; return; }
+  const t = BOARD.trains.find(x=>x.train===MODAL);
+  if(!t){ closeModal(); return; }                      // the train has left the board
+  const al = t.alerts || [];
+  const own = al.filter(a=>a.scope==='train'), line = al.filter(a=>a.scope==='line');
+  const state = (t.state && t.state.length) ? t.state : ['On time'];
+  const msg = a => '<div class="mmsg">'+esc(a.text)+
+    (a.when?' <span class="faint">\u00b7 posted '+esc(a.when)+'</span>':'')+
+    (a.url?' <a href="'+esc(a.url)+'" target="_blank" rel="noopener">details</a>':'')+'</div>';
+  document.getElementById('mtitle').innerHTML = esc(t.destination)+
+    ' <span class="faint">\u00b7 train '+esc(t.train)+(t.depart?' \u00b7 departs at '+esc(t.depart):'')+'</span>';
+  document.getElementById('mbody').innerHTML =
+    '<div class="mstate'+(state.some(s=>s!=='On time')?' bad':'')+'">This train: '+esc(state.join(' \u00b7 '))+'</div>'+
+    (own.length ? '<div class="mh">About this train</div>'+own.map(msg).join('') : '')+
+    (line.length ? '<div class="mh">'+esc(t.line)+(own.length?'':' - nothing names this train')+'</div>'+line.map(msg).join('') : '')+
+    (!own.length && !line.length ? '<div class="mmsg">No NJ Transit message for this train; the state above comes from the board.</div>' : '');
+  modal.hidden = false;
+}
 
 const unit = n => Math.abs(n)===1 ? 'min' : 'mins';
 const signed = n => (n>=0?'+':'')+n;
@@ -1040,6 +1142,7 @@ function render(){
   if(!BOARD) return;
   const b = BOARD;
   document.getElementById('sub').textContent = 'updated ' + b.fetched_at;
+  renderModal();
   // a train whose stop list has not loaded yet is kept rather than hidden
   const list = STOP ? b.trains.filter(t => !(t.stops && t.stops.length) || t.stops.some(s=>s.code===STOP.code)) : b.trains;
   let off=0,pred=0,none=0;
@@ -1071,15 +1174,12 @@ function render(){
     else if(p.tier==='history'){ tcls='off'; tier='no signal';
       extra+='<div class="cand">usually '+p.candidates.map(c=>esc(c.track)+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>'; }
     else { tier='not posted'; }
-    if(al.length) extra += '<div class="alerts"'+(OPEN.has(t.train)?'':' hidden')+'>'+al.map(a=>'<div>'+esc(a.text)+
-      (a.when?' <span class="faint">\u00b7 posted '+esc(a.when)+'</span>':'')+
-      (a.url?' <a href="'+esc(a.url)+'" target="_blank" rel="noopener">details</a>':'')+'</div>').join('')+'</div>';
     const mins = t.minutes===null?'':(t.minutes<=0?'now':'in '+t.minutes+' min');
     let arr = '';
     if(STOP){ const s=(t.stops||[]).find(s=>s.code===STOP.code); if(s && s.time) arr='arrives '+esc(STOP.name)+' at '+esc(s.time); }
     else if(t.arrives) arr = 'arrives at '+esc(t.arrives);
     const meta = [esc(t.line), t.depart?'departs at '+esc(t.depart):'', mins, arr].filter(Boolean).join(' \u00b7 ');
-    const icon = al.length ? '<span class="alert" data-train="'+esc(t.train)+'" title="Delay or alert - tap for details">\u26a0\ufe0e</span>' : '';
+    const icon = al.length ? '<span class="alert" data-train="'+esc(t.train)+'" title="Delay or alert - tap to see how this train is doing">\u26a0\ufe0e</span>' : '';
     return '<div class="row" style="border-left-color:'+(esc(t.color)||'transparent')+'">'+
       '<div class="main"><div class="dest">'+esc(t.destination)+icon+'</div>'+
       '<div class="meta"><span class="dot'+(t.arrived?' on':'')+'"></span>'+meta+'</div>'+
