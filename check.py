@@ -231,7 +231,9 @@ def collect(every):
 
 # ------------------------------------------------------------------- report
 
-def report():
+def report(since=None):
+    """since: 'YYYY-MM-DD' -- score only service days on/after it, for a clean
+    window after a change (rows collected earlier reflect the older setup)."""
     if not os.path.exists(DB):
         sys.exit("No %s yet. Run  python check.py  first." % DB)
     conn = connect()
@@ -241,8 +243,10 @@ def report():
                         "predicted_at, actual, posted_at, flipped, sched_dep, sched_epoch "
                         "FROM results WHERE actual IS NOT NULL AND (watched IS NULL OR watched = 1) "
                         "ORDER BY posted_at").fetchall()
+    if since:
+        rows = [r for r in rows if r[0] >= since]
     unwatched = conn.execute("SELECT COUNT(*) FROM results WHERE actual IS NOT NULL "
-                             "AND watched = 0").fetchone()[0]
+                             "AND watched = 0 AND service_date >= ?", (since or "",)).fetchone()[0]
     print("=" * 68)
     if not rows:
         print("Nothing resolved yet -- no train has posted since checking began.")
@@ -322,6 +326,8 @@ def report():
     # ---- 2. how much of the board are we predicting, live
     polls = conn.execute("SELECT seen_at, n_trains, n_official, n_predicted, n_unposted, "
                          "api_error, latency_ms FROM polls ORDER BY seen_at").fetchall()
+    if since:
+        polls = [p for p in polls if p[0][:10] >= since]
     print("\n" + "=" * 68)
     print("HOW MUCH OF THE BOARD ARE WE PREDICTING?   %d polls" % len(polls))
     print("=" * 68)
@@ -361,9 +367,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--every", type=int, default=30, help="seconds between polls (default 30)")
+    ap.add_argument("--since", default=None, help="with --report: only service days >= YYYY-MM-DD")
     args = ap.parse_args()
     if args.report:
-        report()
+        report(since=args.since)
     else:
         try:
             collect(args.every)

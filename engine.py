@@ -17,15 +17,24 @@ retired without losing what it already taught the codebooks.
 
 Serving model
 -------------
-The board is fetched from NJT when a request arrives and remembered for
-CACHE_SECONDS, so a burst of refreshes costs two API calls, not two per
-refresh -- and nothing is fetched while nobody is looking. This is what lets
-the app run on a host that switches it off when idle (Azure Container Apps
-scale-to-zero): there is no background loop that needs the process alive.
+A background thread polls NJT every POLL_SECONDS and caches the board; requests
+are served from that cache, so the page costs no API calls of its own. The
+poller is what keeps the scorecard filling when nobody is looking, and it is
+only viable because a warm replica is kept running -- under scale-to-zero there
+would be no process alive to run it. It sleeps between QUIET_START and
+QUIET_END (Eastern), when no trains depart Penn; a request during those hours
+still fetches on demand.
 
-Two environment variables matter for hosting:
-    BIND   127.0.0.1 (default, this machine only)  |  0.0.0.0 in a container
-    PORT   8080
+Every snapshot is folded into stats.py, which records what was predicted and
+how it turned out, and serves the live scorecard at /api/stats.
+
+Environment variables that matter for hosting:
+    BIND         127.0.0.1 (default, this machine only) | 0.0.0.0 in a container
+    PORT         8080
+    STATS_DB     where the scorecard lives. In the container this must point at
+                 a mounted volume (see setup_storage.py) -- a container
+                 filesystem is ephemeral and would reset on every deploy.
+    POLL_SECONDS 0 disables the poller and falls back to fetching per request.
 
 How it predicts
 ---------------
@@ -69,6 +78,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import njt_logger as njt
+import stats
 
 HISTORY_DB = njt.DB_PATH          # written by run_logger.py (optional)
 BENCH_DB = "benchmark.db"         # written by benchmark.py
@@ -77,6 +87,17 @@ CODEBOOK_PATH = "codebook.json"
 BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "20"))
+
+# The poller keeps the scorecard filling without anyone visiting the page.
+# It is only viable because a warm replica is kept running; under
+# scale-to-zero there would be no process alive to run it. Set to 0 to
+# disable and go back to fetching only when a request arrives.
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
+
+# No NJ Transit departures from Penn in the small hours, so the poller
+# sleeps through them. Requests are still served if anyone does visit.
+QUIET_START = int(os.environ.get("QUIET_START_HOUR", "2"))   # inclusive, Eastern
+QUIET_END = int(os.environ.get("QUIET_END_HOUR", "4"))       # exclusive, Eastern
 
 GPS_MIN_N, GPS_MIN_PURITY = 3, 0.98    # chosen by held-out sweep
 CKT_MIN_N, CKT_MIN_PURITY = 20, 0.95
@@ -489,6 +510,7 @@ def build_board(books, hist, token):
 CACHE = {"board": None, "error": None, "at": 0.0, "token": None}
 CACHE_LOCK = threading.Lock()
 BOOKS, HIST = None, None
+STATS = None                      # sqlite connection, opened in main()
 
 
 def get_board():
@@ -508,6 +530,7 @@ def get_board():
                 CACHE["board"] = build_board(BOOKS, HIST, CACHE["token"])
                 CACHE["error"] = None
                 CACHE["at"] = time.time()
+                _score(CACHE["board"])
                 break
             except njt.AuthError:
                 CACHE["token"] = None
@@ -526,6 +549,38 @@ def get_board():
         return CACHE["board"], CACHE["error"], 0
 
 
+def _score(board):
+    """Fold a board snapshot into the scorecard, and reload what we predicted
+    earlier today. The reload is what lets a verified badge survive a restart:
+    MEMO lives in memory, the record does not."""
+    if STATS is None or not board:
+        return
+    try:
+        svc = service_date_eastern()
+        for tid, pred, actual in stats.record(
+                STATS, board["trains"], datetime.now(timezone.utc).isoformat(), svc):
+            print("%s  %s predicted %s, actual %s"
+                  % ("HIT " if pred == actual else "MISS", tid, pred, actual))
+        MEMO.update({(svc, tid): trk
+                     for tid, trk in stats.memo_for(STATS, svc).items()})
+    except Exception as e:
+        print("scorecard: %s: %s" % (type(e).__name__, e))
+
+
+def in_quiet_hours():
+    return QUIET_START <= now_eastern().hour < QUIET_END
+
+
+def poller():
+    while True:
+        if not in_quiet_hours():
+            try:
+                get_board()
+            except Exception as e:
+                print("poller: %s: %s" % (type(e).__name__, e))
+        time.sleep(POLL_SECONDS)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -534,6 +589,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/board"):
             board, error, age = get_board()
             body = json.dumps({"board": board, "error": error, "age": age})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+        elif self.path.startswith("/api/stats"):
+            try:
+                body = json.dumps(stats.summary(STATS) if STATS else {"scored": 0})
+            except Exception as e:
+                body = json.dumps({"scored": 0, "error": str(e)})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -590,6 +653,14 @@ padding:2px 6px;border-radius:4px;text-transform:uppercase;margin-top:3px;margin
 .op{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 .err{background:#fde8e8;color:#9b1c1c;padding:10px 12px;border-radius:8px;margin-bottom:14px}
 footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
+.score{margin-top:26px}
+.score h2{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);font-weight:600;margin:0 0 10px}
+.score h2 span{text-transform:none;letter-spacing:0;font-weight:400}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:8px}
+.sitem{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.sitem .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.sitem .v{font-size:20px;font-weight:700;margin-top:3px;letter-spacing:-.02em}
+.sitem .n{font-size:11px;color:var(--dim);margin-top:2px;min-height:14px}
 </style></head><body><div class="wrap">
 <h1>NY Penn - Track Engine</h1>
 <div class="sub" id="sub">loading...</div>
@@ -597,6 +668,10 @@ footer{margin-top:22px;font-size:12px;color:var(--dim);line-height:1.7}
 <div id="err"></div>
 <table><thead><tr><th>Train</th><th>Destination</th><th>Departs</th><th>Track</th><th>Arrived</th></tr></thead>
 <tbody id="rows"></tbody></table>
+<section class="score">
+<h2>Live scorecard <span id="scorewhen"></span></h2>
+<div class="sgrid" id="sgrid"></div>
+</section>
 <footer>
 <div><b>predicted</b> (blue, with a percentage) - we have made a call; NJ Transit has not posted the track yet, so nothing has confirmed or denied it.</div>
 <div><b>verified</b> (green, 100%) - we predicted it, then NJ Transit posted the same track. Prediction confirmed.</div>
@@ -644,12 +719,36 @@ async function tick(){
     }).join('');
   }catch(e){}
 }
+async function score(){
+  try{
+    const s = await (await fetch('/api/stats')).json();
+    const g = document.getElementById('sgrid');
+    if(!s.scored){
+      g.innerHTML = '<div class="sitem"><div class="k">Nothing scored yet</div>'+
+        '<div class="n">Numbers appear once trains start posting.</div></div>';
+      return;
+    }
+    document.getElementById('scorewhen').textContent =
+      '· ' + s.days + (s.days===1?' day':' days') + ' · ' + s.first_day + ' to ' + s.last_day;
+    const m = v => (v===null||v===undefined) ? '--' : v + ' min';
+    const item = (k,v,n) => '<div class="sitem"><div class="k">'+k+'</div>'+
+      '<div class="v">'+v+'</div><div class="n">'+(n||'')+'</div></div>';
+    g.innerHTML =
+      item('Departures scored', s.scored, '') +
+      item('Predicted', s.coverage+'%', s.predicted+' of '+s.scored) +
+      item('Correct', s.accuracy===null?'--':s.accuracy+'%', s.correct+' of '+s.predicted) +
+      item('Changed its mind', s.flip_rate===null?'--':s.flip_rate+'%', s.flips+' of '+s.predicted) +
+      item('Ahead of the board', m(s.lead_over_board), 'median') +
+      item('Before departure', m(s.ours_before_departure), 'NJ Transit: '+m(s.njt_before_departure));
+  }catch(e){}
+}
 tick(); setInterval(tick, 15000);
+score(); setInterval(score, 60000);
 </script></body></html>"""
 
 
 def main():
-    global BOOKS, HIST
+    global BOOKS, HIST, STATS
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
@@ -678,8 +777,24 @@ def main():
                      p["track"] or "--", t["at"], src, t.get("circuit") or ""))
         return
 
-    print("\nserving http://%s:%d   (board fetched on request, cached %ds; Ctrl-C to stop)"
-          % ("localhost" if BIND == "127.0.0.1" else BIND, PORT, CACHE_SECONDS))
+    try:
+        STATS = stats.connect()
+        svc = service_date_eastern()
+        MEMO.update({(svc, tid): trk for tid, trk in stats.memo_for(STATS, svc).items()})
+        print("scorecard: %s (%d departures on record today)"
+              % (stats.DB_PATH, len(MEMO)))
+    except Exception as e:
+        print("scorecard unavailable (%s: %s) -- serving without it"
+              % (type(e).__name__, e))
+        STATS = None
+
+    if POLL_SECONDS:
+        threading.Thread(target=poller, daemon=True).start()
+        print("polling every %ds, quiet %02d:00-%02d:00 Eastern"
+              % (POLL_SECONDS, QUIET_START, QUIET_END))
+
+    print("\nserving http://%s:%d   (Ctrl-C to stop)"
+          % ("localhost" if BIND == "127.0.0.1" else BIND, PORT))
     HTTPServer((BIND, PORT), Handler).serve_forever()
 
 

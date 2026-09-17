@@ -4,5 +4,6 @@
 *
 !engine.py
 !njt_logger.py
+!stats.py
 !codebook.json
 !Dockerfile
