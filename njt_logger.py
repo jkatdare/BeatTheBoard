@@ -148,6 +148,20 @@ def api_post(method, fields):
 
 # --------------------------------------------------------------------- tokens
 
+def get_usage(token, username=None):
+    """Per-method request counts for recent days, from NJ Transit's own
+    counters. Lives under /api/Usage/ rather than /api/TrainData/, so it cannot
+    go through api_post(). The getToken row is the one worth watching: its
+    limit is ~10 a day, and every container start spends one."""
+    user = username or os.environ.get("NJT_USERNAME", "")
+    body, content_type = _multipart({"username": user, "token": token})
+    req = urllib.request.Request(
+        HOST + "/api/Usage/getUsage", data=body,
+        headers={"Content-Type": content_type, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
 def mint_token():
     user, pw = os.environ.get("NJT_USERNAME"), os.environ.get("NJT_PASSWORD")
     if not user or not pw:

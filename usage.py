@@ -29,12 +29,7 @@ def main():
     args = ap.parse_args()
 
     njt.load_env()
-    token = njt.get_token()
-    body, ctype = njt._multipart({"username": njt.os.environ["NJT_USERNAME"], "token": token})
-    req = urllib.request.Request(njt.HOST + "/api/Usage/getUsage", data=body,
-                                 headers={"Content-Type": ctype, "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        rows = json.loads(resp.read().decode("utf-8", "replace"))
+    rows = njt.get_usage(njt.get_token())
     if isinstance(rows, dict) and rows.get("errorMessage"):
         sys.exit("NJT says: " + rows["errorMessage"])
 

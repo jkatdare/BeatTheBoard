@@ -99,6 +99,11 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 QUIET_START = int(os.environ.get("QUIET_START_HOUR", "2"))   # inclusive, Eastern
 QUIET_END = int(os.environ.get("QUIET_END_HOUR", "4"))       # exclusive, Eastern
 
+# NJ Transit caps token minting at ~10 a day and every container start spends
+# one, so the page shows the count. Refreshed on a timer, not per request.
+USAGE_TTL = int(os.environ.get("USAGE_TTL", "600"))
+USAGE = {"at": 0.0, "data": None}
+
 GPS_MIN_N, GPS_MIN_PURITY = 3, 0.98    # chosen by held-out sweep
 CKT_MIN_N, CKT_MIN_PURITY = 20, 0.95
 MIN_DAYS = 3                           # distinct train-days an entry must be seen on
@@ -570,6 +575,34 @@ def _score(board):
         print("scorecard: %s: %s" % (type(e).__name__, e))
 
 
+def token_usage():
+    """Today's getToken count against its limit, or None. Failures are silent:
+    this is a nicety, and it must never interfere with serving the board."""
+    if USAGE["data"] is not None and time.time() - USAGE["at"] < USAGE_TTL:
+        return USAGE["data"]
+    if not CACHE["token"]:
+        return USAGE["data"]
+    USAGE["at"] = time.time()
+    try:
+        rows = njt.get_usage(CACHE["token"])
+        if not isinstance(rows, list):
+            return USAGE["data"]
+        today = now_eastern()
+        wanted = {today.strftime("%m/%d/%Y"), "%d/%d/%d" % (today.month, today.day, today.year)}
+        used, limit = 0, 10
+        for r in rows:
+            if r.get("Request_Type") == "getToken":
+                if r.get("Request_Date") in wanted:
+                    used = int(r.get("Daily_Request_Made") or 0)
+                    limit = int(r.get("Usage_Limit") or 10)
+                    break
+                limit = int(r.get("Usage_Limit") or limit)
+        USAGE["data"] = {"used": used, "limit": limit}
+    except Exception as e:
+        print("usage: %s: %s" % (type(e).__name__, e))
+    return USAGE["data"]
+
+
 def in_quiet_hours():
     return QUIET_START <= now_eastern().hour < QUIET_END
 
@@ -597,7 +630,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
         elif self.path.startswith("/api/stats"):
             try:
-                body = json.dumps(stats.summary(STATS) if STATS else {"scored": 0})
+                payload = stats.summary(STATS) if STATS else {"scored": 0}
+                payload["tokens"] = token_usage()
+                body = json.dumps(payload)
             except Exception as e:
                 body = json.dumps({"scored": 0, "error": str(e)})
             self.send_response(200)
@@ -621,9 +656,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BeatTheBoard - NY Penn</title><style>
 :root{--bg:#f6f6f4;--card:#fff;--fg:#17171a;--dim:#6b6b73;--faint:#9b9ba3;--line:#e6e6e2;
---ok:#0a7d32;--okbg:#e7f4eb;--pred:#1257a8;--predbg:#e7f0fb;--warn:#8a6d1f;--warnbg:#fbf4e2;}
+--ok:#0a7d32;--okbg:#e7f4eb;--pred:#c2410c;--predbg:#fdf0e7;--warn:#8a6d1f;--warnbg:#fbf4e2;}
 @media(prefers-color-scheme:dark){:root{--bg:#131316;--card:#1d1d22;--fg:#ececee;--dim:#9a9aa4;
---faint:#6c6c76;--line:#2c2c33;--ok:#4ade80;--okbg:#122a1b;--pred:#7cb0f5;--predbg:#11233d;
+--faint:#6c6c76;--line:#2c2c33;--ok:#4ade80;--okbg:#122a1b;--pred:#fb923c;--predbg:#33200f;
 --warn:#e0be62;--warnbg:#2d2712;}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;
@@ -665,26 +700,57 @@ background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:
 .sv{font-size:21px;font-weight:600;margin-top:3px;letter-spacing:-.02em;
 font-variant-numeric:tabular-nums}
 .sn{font-size:11.5px;color:var(--faint);margin-top:1px;min-height:15px}
+.hd{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.views{display:flex;flex-shrink:0}
+.views button{font-family:inherit;font-size:12px;padding:6px 11px;border:1px solid var(--line);
+background:transparent;color:var(--dim);cursor:pointer}
+.views button:first-child{border-radius:7px 0 0 7px}
+.views button:last-child{border-radius:0 7px 7px 0;border-left:none}
+.views button.on{background:var(--card);color:var(--fg);border-color:var(--faint)}
+body[data-view=cards] .board{background:none;border:none;border-radius:0;overflow:visible}
+body[data-view=cards] .row{background:var(--card);border:1px solid var(--line);
+border-left-width:5px;border-radius:12px;margin-bottom:9px;padding:15px 17px 15px 14px}
+body[data-view=cards] .row:last-child{margin-bottom:0;border-bottom:1px solid var(--line)}
+body[data-view=cards] .dest{font-size:16.5px}
+body[data-view=cards] .trk{font-size:46px}
+body[data-view=cards] .trk.off{font-size:34px}
+body[data-view=cards] .right{min-width:84px}
+.tokens{margin-top:10px;font-size:12px;color:var(--faint)}
+.tokens.warn{color:var(--warn)}
+.tokens b{font-variant-numeric:tabular-nums;font-weight:600}
 footer{margin-top:26px;font-size:12px;color:var(--faint);line-height:1.75}
 footer b{color:var(--dim);font-weight:500}
 </style></head><body><div class="wrap">
-<h1>NY Penn</h1>
-<div class="sub" id="sub">loading</div>
+<div class="hd">
+<div><h1>NY Penn</h1><div class="sub" id="sub">loading</div></div>
+<div class="views"><button id="vlist" type="button">List</button><button id="vcards" type="button">Cards</button></div>
+</div>
 <div class="tally" id="tally"></div>
 <div id="err"></div>
 <div class="board" id="rows"></div>
 
 <h2>Live scorecard <span id="scorewhen"></span></h2>
 <div class="sgrid" id="sgrid"></div>
+<div class="tokens" id="tokens"></div>
 
 <footer>
 <div><b>confirmed</b> - we called it early, then NJ Transit posted the same track.</div>
-<div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it.</div>
+<div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it. Capped at 99%: without their announcement it is never certain.</div>
 <div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, or we got it wrong - and if we got it wrong, it says so underneath.</div>
 <div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
 <div>The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
 <script>
+function setView(v){
+  document.body.dataset.view = v;
+  document.getElementById('vlist').classList.toggle('on', v === 'list');
+  document.getElementById('vcards').classList.toggle('on', v === 'cards');
+  try{ localStorage.setItem('btb-view', v); }catch(e){}
+}
+document.getElementById('vlist').onclick = function(){ setView('list'); };
+document.getElementById('vcards').onclick = function(){ setView('cards'); };
+setView(function(){ try{ return localStorage.getItem('btb-view') || 'list'; }
+                    catch(e){ return 'list'; } }());
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 async function tick(){
   try{
@@ -704,7 +770,7 @@ async function tick(){
       else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
         if(p.missed) extra='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>'; }
       else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
-        tier='predicted'+(p.confidence?' '+Math.round(p.confidence*100)+'%':''); }
+        tier='predicted'+(p.confidence?' '+Math.min(99,Math.round(p.confidence*100))+'%':''); }
       else if(p.tier==='history'){ tcls='off'; tier='no signal';
         extra='<div class="cand">usually '+p.candidates.map(c=>esc(c.track)+' ('+Math.round(c.share*100)+'%)').join(', ')+'</div>'; }
       else { tier='not posted'; }
@@ -723,6 +789,14 @@ async function tick(){
 async function score(){
   try{
     const s = await (await fetch('/api/stats')).json();
+    const tk = document.getElementById('tokens');
+    if(s.tokens){
+      const used = s.tokens.used, lim = s.tokens.limit || 10;
+      tk.className = 'tokens' + (used >= lim - 3 ? ' warn' : '');
+      tk.innerHTML = 'API tokens minted today <b>' + used + ' / ' + lim + '</b>' +
+        (used >= lim ? ' \u00b7 limit reached, predictions resume after midnight'
+                     : ' \u00b7 each deploy or restart spends one');
+    } else { tk.textContent = ''; }
     const g = document.getElementById('sgrid');
     if(!s.scored){
       g.innerHTML='<div class="sitem"><div class="sk">Nothing scored yet</div>'+
