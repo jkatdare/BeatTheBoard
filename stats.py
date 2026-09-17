@@ -16,20 +16,33 @@ Two rules that keep the numbers honest:
   * The FIRST prediction is the one scored. Changing to the right answer later
     still counts as a miss, and is separately reported as a flip.
 
-STATS_DB points at the database. In the container that must be a mounted
-volume: a container filesystem is ephemeral, so without the mount every deploy
-would reset the record. Rollback journalling (not WAL) because WAL needs shared
-memory that SMB file shares like Azure Files do not provide.
+Storage
+-------
+The working table lives in an in-memory SQLite database. After every poll it
+is snapshotted to a JSON file (write to a temp file, then atomic rename), and
+that file is reloaded at startup. STATS_DB names the snapshot; a ".db" suffix
+is rewritten to ".json".
+
+Why not just put a SQLite file on the mounted share: SQLite locks the file
+with byte-range locks, and SMB shares like Azure Files do not honour them --
+the first connect() fails with "database is locked". Plain file writes work
+fine there, which is all a JSON snapshot needs.
 """
 
+import json
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
-DB_PATH = os.environ.get("STATS_DB", "stats.db")
+_raw = os.environ.get("STATS_DB", "stats.db")
+DB_PATH = _raw[:-3] + ".json" if _raw.endswith(".db") else _raw   # the snapshot
 
 _LOCK = threading.Lock()          # one writer at a time: poller + request threads
+
+COLUMNS = ["service_date", "train_id", "line", "destination", "sched_epoch",
+           "predicted", "signal", "confidence", "predicted_at", "flipped",
+           "actual", "posted_at", "watched"]
 
 DDL = """
 CREATE TABLE IF NOT EXISTS results (
@@ -53,12 +66,35 @@ CREATE INDEX IF NOT EXISTS idx_results_day ON results (service_date);
 
 
 def connect():
+    """In-memory table, seeded from the snapshot if there is one."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(DDL)
+    if os.path.exists(DB_PATH):
+        try:
+            with open(DB_PATH, "r", encoding="utf-8") as fh:
+                rows = json.load(fh).get("results", [])
+            conn.executemany(
+                "INSERT OR REPLACE INTO results (%s) VALUES (%s)"
+                % (", ".join(COLUMNS), ", ".join("?" * len(COLUMNS))),
+                [tuple(r.get(c) for c in COLUMNS) for r in rows])
+            conn.commit()
+        except (OSError, ValueError, sqlite3.DatabaseError) as e:
+            print("scorecard: could not load %s (%s: %s) -- starting empty"
+                  % (DB_PATH, type(e).__name__, e))
+    return conn
+
+
+def _snapshot(conn):
+    rows = [dict(zip(COLUMNS, r)) for r in conn.execute(
+        "SELECT %s FROM results" % ", ".join(COLUMNS))]
     folder = os.path.dirname(DB_PATH)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
-    conn.executescript(DDL)
-    return conn
+    tmp = DB_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"saved_at": datetime.utcnow().isoformat() + "Z",
+                   "results": rows}, fh, separators=(",", ":"))
+    os.replace(tmp, DB_PATH)
 
 
 def _iso_to_epoch(iso):
@@ -71,8 +107,8 @@ def _iso_to_epoch(iso):
 # ------------------------------------------------------------------ recording
 
 def record(conn, rows, now_iso, service_date):
-    """Fold one board snapshot into the record. Returns [(train, predicted,
-    actual)] for predictions that resolved on this snapshot."""
+    """Fold one board snapshot into the record and persist it. Returns
+    [(train, predicted, actual)] for predictions that resolved this time."""
     resolved = []
     with _LOCK:
         for t in rows:
@@ -131,11 +167,15 @@ def record(conn, rows, now_iso, service_date):
                              "AND train_id=? AND sched_epoch IS NULL",
                              (meta[2], service_date, tid))
         conn.commit()
+        try:
+            _snapshot(conn)
+        except OSError as e:
+            print("scorecard: snapshot failed (%s: %s)" % (type(e).__name__, e))
     return resolved
 
 
 def memo_for(conn, service_date):
-    """train_id -> first predicted track, for today. Lets the verified badge
+    """train_id -> first predicted track, for today. Lets the confirmed badge
     survive a restart: without this the app forgets what it predicted before
     the container came back."""
     with _LOCK:
@@ -146,9 +186,22 @@ def memo_for(conn, service_date):
 
 # ------------------------------------------------------------------- scorecard
 
+def _median(values):
+    v = sorted(x for x in values if x is not None)
+    return round(v[len(v) // 2], 1) if v else None
+
+
+def _mean(values):
+    v = [x for x in values if x is not None]
+    return round(sum(v) / len(v), 1) if v else None
+
+
 def summary(conn, since=None):
-    """The numbers the page shows. None of the medians are means: a handful of
-    hour-long leads would pull an average well off what a rider experiences."""
+    """The scorecard. Lead times are reported as median AND mean: the
+    distribution is right-skewed (a set that sits at the platform for hours
+    gives a multi-hour "lead"), so the mean overstates what a rider typically
+    gets while the median is the honest typical case. Both are shown so the
+    skew is visible rather than hidden."""
     where = "actual IS NOT NULL AND (watched IS NULL OR watched = 1)"
     args = []
     if since:
@@ -158,7 +211,6 @@ def summary(conn, since=None):
         rows = conn.execute(
             "SELECT predicted, actual, predicted_at, posted_at, flipped, sched_epoch, "
             "service_date FROM results WHERE " + where, args).fetchall()
-
     if not rows:
         return {"scored": 0}
 
@@ -166,29 +218,21 @@ def summary(conn, since=None):
     correct = [r for r in pred if r[0] == r[1]]
     days = sorted({r[6] for r in rows})
 
-    def med(values):
-        v = sorted(x for x in values if x is not None)
-        return round(v[len(v) // 2], 1) if v else None
-
-    lead = med((_iso_to_epoch(r[3]) - _iso_to_epoch(r[2])) / 60
-               for r in pred if _iso_to_epoch(r[2]) and _iso_to_epoch(r[3]))
-    ours_before = med((r[5] - _iso_to_epoch(r[2])) / 60
-                      for r in pred if r[5] and _iso_to_epoch(r[2]))
-    njt_before = med((r[5] - _iso_to_epoch(r[3])) / 60
-                     for r in rows if r[5] and _iso_to_epoch(r[3]))
+    ours = [(r[5] - _iso_to_epoch(r[2])) / 60 for r in pred if r[5] and _iso_to_epoch(r[2])]
+    njt = [(r[5] - _iso_to_epoch(r[3])) / 60 for r in rows if r[5] and _iso_to_epoch(r[3])]
+    lead = [(_iso_to_epoch(r[3]) - _iso_to_epoch(r[2])) / 60
+            for r in pred if _iso_to_epoch(r[2]) and _iso_to_epoch(r[3])]
 
     return {
-        "scored": len(rows),
+        "scored": len(rows),                                   # trains seen before posting, now posted
         "predicted": len(pred),
         "coverage": round(100.0 * len(pred) / len(rows), 1),
         "correct": len(correct),
         "accuracy": round(100.0 * len(correct) / len(pred), 1) if pred else None,
         "flips": sum(1 for r in pred if r[4]),
-        "flip_rate": round(100.0 * sum(1 for r in pred if r[4]) / len(pred), 1) if pred else None,
-        "lead_over_board": lead,
-        "ours_before_departure": ours_before,
-        "njt_before_departure": njt_before,
+        "ours_median": _median(ours), "ours_mean": _mean(ours),   # minutes before departure
+        "njt_median": _median(njt), "njt_mean": _mean(njt),
+        "lead_median": _median(lead),                             # ours minus NJT, per train
         "days": len(days),
-        "first_day": days[0] if days else None,
-        "last_day": days[-1] if days else None,
+        "first_day": days[0], "last_day": days[-1],
     }

@@ -701,20 +701,14 @@ background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:
 font-variant-numeric:tabular-nums}
 .sn{font-size:11.5px;color:var(--faint);margin-top:1px;min-height:15px}
 .hd{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
-.views{display:flex;flex-shrink:0}
-.views button{font-family:inherit;font-size:12px;padding:6px 11px;border:1px solid var(--line);
-background:transparent;color:var(--dim);cursor:pointer}
-.views button:first-child{border-radius:7px 0 0 7px}
-.views button:last-child{border-radius:0 7px 7px 0;border-left:none}
-.views button.on{background:var(--card);color:var(--fg);border-color:var(--faint)}
-body[data-view=cards] .board{background:none;border:none;border-radius:0;overflow:visible}
-body[data-view=cards] .row{background:var(--card);border:1px solid var(--line);
-border-left-width:5px;border-radius:12px;margin-bottom:9px;padding:15px 17px 15px 14px}
-body[data-view=cards] .row:last-child{margin-bottom:0;border-bottom:1px solid var(--line)}
-body[data-view=cards] .dest{font-size:16.5px}
-body[data-view=cards] .trk{font-size:46px}
-body[data-view=cards] .trk.off{font-size:34px}
-body[data-view=cards] .right{min-width:84px}
+.board{background:none;border:none;border-radius:0;overflow:visible}
+.row{background:var(--card);border:1px solid var(--line);border-left-width:5px;
+border-radius:12px;margin-bottom:9px;padding:15px 17px 15px 14px}
+.row:last-child{margin-bottom:0;border-bottom:1px solid var(--line)}
+.dest{font-size:16.5px}
+.trk{font-size:46px}
+.trk.off{font-size:34px}
+.right{min-width:84px}
 .tokens{margin-top:10px;font-size:12px;color:var(--faint)}
 .tokens.warn{color:var(--warn)}
 .tokens b{font-variant-numeric:tabular-nums;font-weight:600}
@@ -723,7 +717,6 @@ footer b{color:var(--dim);font-weight:500}
 </style></head><body><div class="wrap">
 <div class="hd">
 <div><h1>NY Penn</h1><div class="sub" id="sub">loading</div></div>
-<div class="views"><button id="vlist" type="button">List</button><button id="vcards" type="button">Cards</button></div>
 </div>
 <div class="tally" id="tally"></div>
 <div id="err"></div>
@@ -741,16 +734,6 @@ footer b{color:var(--dim);font-weight:500}
 <div>The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
 <script>
-function setView(v){
-  document.body.dataset.view = v;
-  document.getElementById('vlist').classList.toggle('on', v === 'list');
-  document.getElementById('vcards').classList.toggle('on', v === 'cards');
-  try{ localStorage.setItem('btb-view', v); }catch(e){}
-}
-document.getElementById('vlist').onclick = function(){ setView('list'); };
-document.getElementById('vcards').onclick = function(){ setView('cards'); };
-setView(function(){ try{ return localStorage.getItem('btb-view') || 'list'; }
-                    catch(e){ return 'list'; } }());
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 async function tick(){
   try{
@@ -794,8 +777,7 @@ async function score(){
       const used = s.tokens.used, lim = s.tokens.limit || 10;
       tk.className = 'tokens' + (used >= lim - 3 ? ' warn' : '');
       tk.innerHTML = 'API tokens minted today <b>' + used + ' / ' + lim + '</b>' +
-          (used >= lim ? ' · limit reached, predictions resume after midnight'
-                       : ' · each deploy or restart spends one');
+        (used >= lim ? ' · limit reached, predictions resume after midnight' : '');
     } else { tk.textContent = ''; }
     const g = document.getElementById('sgrid');
     if(!s.scored){
@@ -809,12 +791,11 @@ async function score(){
     const it = (k,v,n) => '<div class="sitem"><div class="sk">'+k+'</div><div class="sv">'+v+
       '</div><div class="sn">'+(n||'')+'</div></div>';
     g.innerHTML =
-      it('Scored', s.scored, 'departures') +
-      it('Predicted', s.coverage+'%', s.predicted+' of '+s.scored) +
-      it('Correct', s.accuracy===null?'--':s.accuracy+'%', s.correct+' of '+s.predicted) +
-      it('Flips', s.flip_rate===null?'--':s.flip_rate+'%', 'changed before posting') +
-      it('Ahead of board', m(s.lead_over_board), 'median') +
-      it('Before departure', m(s.ours_before_departure), 'NJ Transit '+m(s.njt_before_departure));
+      it('Coverage', s.coverage+'%', s.predicted+' of '+s.scored+' trains predicted') +
+      it('Accuracy', s.accuracy===null?'--':s.accuracy+'%',
+         s.correct+' of '+s.predicted+' predictions correct') +
+      it('BeatTheBoard', m(s.ours_median), 'median before departure \u00b7 mean '+m(s.ours_mean)) +
+      it('NJ Transit board', m(s.njt_median), 'median before departure \u00b7 mean '+m(s.njt_mean));
   }catch(e){}
 }
 tick(); setInterval(tick, 15000);
