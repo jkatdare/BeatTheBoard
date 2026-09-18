@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 
 APP_URL = os.environ.get(
     "BOARD_URL",
-    "https://beattheboard.thankfulpond-632cee48.eastus2.azurecontainerapps.io").rstrip("/")
+    "https://beattheboard.net").rstrip("/")
 DB = "check.db"
 SERVICE_DAY_CUTOFF_HOUR = 3        # trains after midnight belong to the prior day
 
