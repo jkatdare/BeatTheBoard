@@ -20,12 +20,7 @@ Other information shown:
 
 ** destination is cached on your local device, use the same browser and avoid incognito mode
 
-On held-out data it predicts about three quarters of departures, is right
-about 98% of the time when it does predict, and gets there a median of 13
-minutes before the official board. The board's own lead is about 10 minutes, so in
-practice you know roughly 20 to 25 minutes before departure. It says nothing
-rather than guess.
-
+XXXXXXXXXXXXXX - live report card here?
 
 ## How it works
 
@@ -38,28 +33,24 @@ Circuits belong to Amtrak's A and JO interlockings in PSNY, and
 their names encode the platform track. For ex. AA-A180TK is track 4, JO-AJO16TK is
 track 6. Once a train enters PSNY its circuit tells you where it is going before the board does.
 
-The second is in getTrainSchedule, the departure board itself. Each row has a
-latitude and longitude. It looks like a live position, but it is a fixed
-coordinate per track, the spot where the train sits at the platform, and it
-appears before the TRACK field is filled in. It only exists for tracks 1 to 3
-and 10 to 14.
+2. getTrainSchedule - the departure board. Each row has a
+latitude and longitude which is a fixed coordinate per track, where the train sits at the platform, and it
+appears before the TRACK field is filled in. It only exists for tracks 1 to 3 and 10 to 14.
 
-The two signals cover different tracks, which is why using both is worth much
-more than either alone.
+The two signals cover different tracks, so combining them increases coverage. 
 
 Both are decoded with lookup tables in codebook.json, built by logging the API
 for a couple of weeks and joining each circuit and coordinate to the track
 that was eventually posted. A circuit or coordinate goes into the table only
 if it maps to a single track at least 95% of the time. Anything ambiguous is
-left out, which is why the app abstains instead of guessing.
+left out, leading to the app predicting nothing rather than guessing. 
 
-Things I tried that did not work, in case you are thinking of them:
+Things I tried that did not work:
 
-- Per-train history, "this train is usually on track 9." Trains at Penn do
+- Per-train history, "this train is usually on track 9." Trains at PSNY do
   not use the same track from day to day. Guessing the most common track for
   a train number was right about 16% of the time.
-- Ruling out occupied tracks. Most tracks are empty at any given moment, so
-  elimination almost never narrows it to one.
+- Ruling out occupied tracks. Most tracks are empty at any given moment.
 - The GTFS feeds. They have no track or platform data for NJ Transit.
 - Predicting a departing train's track from the track its inbound equipment
   arrived on. NJ Transit does not publish arrival tracks anywhere.
@@ -108,6 +99,10 @@ Then:
 and open http://localhost:8080. The .env file, the token cache, and all
 databases are gitignored and never leave your machine.
 
+
+Or.
+
+Visit beattheboard.net
 ## Disclaimer
 
 Not affiliated with NJ Transit or Amtrak. A prediction is a prediction. Check
