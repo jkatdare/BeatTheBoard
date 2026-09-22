@@ -1,23 +1,24 @@
 # BeatTheBoard  https://beattheboard.net
 
-I work in NYC and live in NJ, so I take NJ Transit out of Penn Station, and I wanted to get on the train before the crowd of people form. 
+I work in NYC and live in NJ, so I take NJ Transit out of Penn Station, and I wanted to get on the train before the crowd of people form above the track stairs 
 
 ## What it does
 
 For each NJ Transit departure at Penn it shows one of three things:
 
-- the official track, once the board has posted it
-- a predicted track, with a confidence percentage
-- nothing, if it does not know
+- official track, once the board has posted it
+- predicted track, with a confidence percentage
+- nothing, if there is no data or low confidence
 
-Each row also says when the train departs and when it arrives, how many
-minutes before departure we called the track and how many minutes before NJ
-Transit posted it, and a warning triangle if there is a delay or an NJ
-Transit alert for that train or its line. Tap it to see whether that
-particular train is on time, late, canceled or making extra stops, with the
-full alert text. Type your
-stop in the box at the top to see only the trains that stop there, with the
-time they get there; the stop is remembered on your device.
+Other information shown:
+
+- departure time and time to it
+- arrival time and time to it, if destination is set
+- minutes before departure BeatTheBoard called the track, as BTB + xx mins
+- minutes before NJ Transit called the track, as NJT + xx mins
+- delays as a warning triangle with details in a popup when clicked
+
+** destination is cached on your local device, use the same browser and avoid incognito mode
 
 On held-out data it predicts about three quarters of departures, is right
 about 98% of the time when it does predict, and gets there a median of 13
@@ -25,21 +26,17 @@ minutes before the official board. The board's own lead is about 10 minutes, so 
 practice you know roughly 20 to 25 minutes before departure. It says nothing
 rather than guess.
 
-The idea came from a friend who built a similar tool.
 
 ## How it works
 
-There is no machine learning in this. NJ Transit runs a public developer API
-(developer.njtransit.com, free account, RailData product) that powers their
-own departure screens. Two fields in that API turn out to reveal the track
-assignment before the track itself is published.
+NJ Transit Developer API: developer.njtransit.com
+RailData is a free API service provided by NJT.
+The track comes from 2 pieces sources. 
 
-The first is in getVehicleData, which lists every active train with a field
-called ICS_TRACK_CKT: the signalling track circuit the train is currently on.
-At Penn Station the circuits belong to Amtrak's A and JO interlockings, and
-their names encode the platform track. AA-A180TK is track 4. JO-AJO16TK is
-track 6. Once a train is routed into the station, its circuit tells you where
-it is going, well before the board says so.
+1. getVehicleData - which contains ICS_TRACK_CKT, or the current track of every active train. 
+Circuits belong to Amtrak's A and JO interlockings in PSNY, and
+their names encode the platform track. For ex. AA-A180TK is track 4, JO-AJO16TK is
+track 6. Once a train enters PSNY its circuit tells you where it is going before the board does.
 
 The second is in getTrainSchedule, the departure board itself. Each row has a
 latitude and longitude. It looks like a live position, but it is a fixed
