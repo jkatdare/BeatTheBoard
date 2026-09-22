@@ -20,8 +20,6 @@ Other information shown:
 
 ** destination is cached on your local device, use the same browser and avoid incognito mode
 
-XXXXXXXXXXXXXX - live report card here?
-
 ## Report card
 
 Refreshed nightly from the live site by a GitHub Action
