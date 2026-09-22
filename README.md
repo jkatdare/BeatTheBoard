@@ -22,6 +22,15 @@ Other information shown:
 
 XXXXXXXXXXXXXX - live report card here?
 
+## Report card
+
+Refreshed nightly from the live site by a GitHub Action
+(.github/workflows/readme-stats.yml). Same numbers as the bottom of the page.
+
+<!-- stats:start -->
+Not yet generated.
+<!-- stats:end -->
+
 ## How it works
 
 NJ Transit Developer API: developer.njtransit.com
@@ -62,7 +71,7 @@ Everything is standard library Python. There is nothing to install.
 - engine.py: the web app. A background poller fetches the board and vehicle
   feed from NJ Transit every 5 seconds, decodes the two signals, and serves
   the page from that snapshot. It also keeps the report card on the page: a
-  prediction only counts if it was showing at least 30 seconds before NJ
+  prediction only counts if it was showing at least a minute before NJ
   Transit posted the track. Also builds codebook.json from collected data
   with --rebuild.
 - njt_logger.py: shared API client (token handling, the multipart POST format

@@ -1046,7 +1046,7 @@ footer b{color:var(--dim);font-weight:500}
 <div><h1>NY Penn Station Departures</h1><div class="sub" id="sub">loading</div></div>
 </div>
 <div class="find">
-<input id="stop" type="text" placeholder="Your stop - start typing, e.g. Summit" autocomplete="off" spellcheck="false" aria-label="Your stop">
+<input id="stop" type="text" placeholder="Destination" autocomplete="off" spellcheck="false" aria-label="Your stop">
 <button id="clear" type="button" title="Show all trains" aria-label="Show all trains">&times;</button>
 <div class="menu" id="menu"></div>
 </div>
@@ -1065,7 +1065,7 @@ footer b{color:var(--dim);font-weight:500}
 <div><b>BTB +x mins</b> - how long before the scheduled departure we called the track. <b>NJT +x mins</b> - how long before departure NJ Transit posted it.</div>
 <div><b>\u26a0\ufe0e</b> - a delay, or an NJ Transit alert for this train or its whole line. Tap it to see whether this particular train is on time, late, canceled or making extra stops, and the full alert text.</div>
 <div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
-<div>Type your stop above to see only the trains that stop there, with the time they get there. It is remembered on this device. The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
+<div>Type your destination above to see only the trains that stop there, with the time they get there. It is remembered on this device. The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
 <div class="modal" id="modal" hidden><div class="mbox">
 <div class="mhead"><div id="mtitle"></div><button id="mclose" type="button" aria-label="Close">&times;</button></div>
@@ -1167,7 +1167,7 @@ function render(){
     if(lead.length) extra += '<div class="note">'+lead.join(' \u00b7 ')+'</div>';
     if(p.tier==='verified'){ num=p.track; ncls='ok'; tcls='ok'; tier='confirmed'; }
     else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
-      if(p.missed) extra+='<div class="miss">we predicted '+esc(p.missed)+' - that was wrong</div>';
+      if(p.missed) extra+='<div class="miss">predicted track '+esc(p.missed)+' was wrong</div>';
       else if(p.late) extra+='<div class="cand">we called it too, but under __MIN_LEAD__ s before NJ Transit did - not counted</div>'; }
     else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
       tier='predicted'+(p.confidence?' '+Math.min(99,Math.round(p.confidence*100))+'%':''); }
@@ -1176,8 +1176,8 @@ function render(){
     else { tier='not posted'; }
     const mins = t.minutes===null?'':(t.minutes<=0?'now':'in '+t.minutes+' min');
     let arr = '';
+    // arrival time only for the destination the rider picked (issue 21)
     if(STOP){ const s=(t.stops||[]).find(s=>s.code===STOP.code); if(s && s.time) arr='arrives '+esc(STOP.name)+' at '+esc(s.time); }
-    else if(t.arrives) arr = 'arrives at '+esc(t.arrives);
     const meta = [esc(t.line), t.depart?'departs at '+esc(t.depart):'', mins, arr].filter(Boolean).join(' \u00b7 ');
     const icon = al.length ? '<span class="alert" data-train="'+esc(t.train)+'" title="Delay or alert - tap to see how this train is doing">\u26a0\ufe0e</span>' : '';
     return '<div class="row" style="border-left-color:'+(esc(t.color)||'transparent')+'">'+

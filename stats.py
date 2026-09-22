@@ -52,7 +52,7 @@ DB_PATH = _raw[:-3] + ".json" if _raw.endswith(".db") else _raw   # the snapshot
 
 # A call has to be showing this long before NJ Transit posts to count as
 # having beaten the board. Measured as the proven lead (see proven_lead).
-MIN_LEAD = int(os.environ.get("MIN_LEAD_SECONDS", "30"))
+MIN_LEAD = int(os.environ.get("MIN_LEAD_SECONDS", "60"))
 
 # Rows written before unposted_at existed were sampled every 30 s. For those,
 # the proven lead is the measured lead minus one such interval.

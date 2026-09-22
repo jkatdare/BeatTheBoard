@@ -1,0 +1,57 @@
+# Nightly: pull the live report card from beattheboard.net and write it into
+# the README between the <!-- stats --> markers. Pushes a commit only when the
+# numbers changed. deploy.yml ignores README-only pushes, so this never
+# triggers a rebuild.
+
+name: readme-stats
+
+on:
+  schedule:
+    - cron: "15 8 * * *"      # 08:15 UTC, after the 2-4 AM Eastern quiet hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the report card and rewrite the README block
+        run: |
+          python3 - <<'EOF'
+          import json, re, urllib.request
+          s = json.load(urllib.request.urlopen("https://beattheboard.net/api/stats", timeout=30))
+          us = lambda d: "%s-%s-%s" % (d[5:7], d[8:10], d[0:4]) if d else ""
+          m = lambda v: "--" if v is None else "%s min" % v
+          if s.get("scored"):
+              block = "\n".join([
+                  "%d days, %s to %s" % (s["days"], us(s["first_day"]), us(s["last_day"])),
+                  "",
+                  "| | |",
+                  "|---|---|",
+                  "| Coverage | %s%% (%d of %d trains called %d+ s before the board) |"
+                  % (s["coverage"], s["predicted"], s["scored"], s["min_lead"]),
+                  "| Accuracy | %s (%d of %d predictions correct) |"
+                  % ("--" if s["accuracy"] is None else "%s%%" % s["accuracy"], s["correct"], s["predicted"]),
+                  "| BeatTheBoard, before departure | median %s, mean %s |" % (m(s["ours_median"]), m(s["ours_mean"])),
+                  "| NJ Transit board, before departure | median %s, mean %s |" % (m(s["njt_median"]), m(s["njt_mean"])),
+              ])
+          else:
+              block = "Nothing scored yet."
+          p = "README.md"
+          src = open(p, encoding="utf-8").read()
+          new = re.sub(r"(<!-- stats:start -->\n).*?(\n<!-- stats:end -->)",
+                       lambda mm: mm.group(1) + block + mm.group(2), src, flags=re.S)
+          if new != src:
+              open(p, "w", encoding="utf-8").write(new)
+          EOF
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || git commit -m "README: nightly report card" && git push
