@@ -32,7 +32,9 @@ Three slower feeds ride along with the poll, each on its own timer: NJ
 Transit's rail alerts (getStationMSG, every ALERT_SECONDS) for the warning
 triangle, every train's stop list (getTrainSchedule, every STOPS_SECONDS) for
 the stop filter, arrival times and the train details popup, and the station
-list (getStationList, once a day) for the search box.
+list (getStationList, once a day) for the search box. Alert text that NJ
+Transit's API has garbled is restored from their rail advisories RSS feed
+(see restore_text).
 
 Environment variables that matter for hosting:
     BIND         127.0.0.1 (default, this machine only) | 0.0.0.0 in a container
@@ -83,6 +85,8 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -478,6 +482,92 @@ def _scope_codes(scope):
     return codes
 
 
+# NJ Transit's API turns every non-ASCII character in alert text into a
+# literal "?" -- the curly apostrophe in "nor'easter", the non-breaking hyphen
+# in "real-time", the em dash in "priority--stay" -- and sends the result
+# declared as UTF-8, so nothing on our side can undo it. Their public rail
+# advisories RSS feed carries the same alerts intact, keyed by the same node
+# ID. The API text is swapped for the feed's only when the two are identical
+# once the feed's non-ASCII characters are folded to "?", so a different or
+# edited alert can never be substituted. Anything the feed cannot restore is
+# repaired by pattern (fix_text).
+ALERT_RSS = os.environ.get("ALERT_RSS", "https://www.njtransit.com/rss/RailAdvisories_feed.xml")
+RSS_SECONDS = int(os.environ.get("RSS_SECONDS", "300"))
+RSS = {"at": 0.0, "by_id": {}, "busy": False}
+
+
+def _squash(text):
+    """Entities decoded, runs of whitespace collapsed."""
+    return re.sub(r"\s+", " ", html.unescape(str(text or ""))).strip()
+
+
+def _fold(text):
+    """What NJ Transit's API does to alert text: non-ASCII -> '?'."""
+    return "".join(c if ord(c) < 128 else "?" for c in text)
+
+
+def parse_rss(raw):
+    """Node ID -> alert text, from the RSS feed's bytes."""
+    out = {}
+    for item in ET.fromstring(raw).iter("item"):
+        nid = (item.findtext("link") or item.findtext("guid") or "").rstrip("/").rsplit("/", 1)[-1]
+        text = _squash(item.findtext("description"))
+        if nid.isdigit() and text:
+            out[nid] = text
+    return out
+
+
+def _refresh_rss():
+    try:
+        req = urllib.request.Request(
+            ALERT_RSS, headers={"User-Agent": "BeatTheBoard/1.0 (+https://beattheboard.net)"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            RSS["by_id"] = parse_rss(resp.read(2000000))
+    except Exception as e:
+        print("alert rss: %s: %s" % (type(e).__name__, e))
+    finally:
+        RSS["busy"] = False
+
+
+def rss_original(mid):
+    """The feed's text for this alert, or None. A miss starts a refresh in
+    the background -- at most once every RSS_SECONDS, and only for an alert
+    that needs one -- so a slow njtransit.com never holds up a poll. The
+    restored text shows from the next alert refresh."""
+    if not mid:
+        return None
+    if (mid not in RSS["by_id"] and not RSS["busy"]
+            and time.time() - RSS["at"] >= RSS_SECONDS):
+        RSS["busy"], RSS["at"] = True, time.time()
+        threading.Thread(target=_refresh_rss, daemon=True).start()
+    return RSS["by_id"].get(mid)
+
+
+_Q_WORDS = re.compile(r"\b(nor|o)\?(easter|clock)\b", re.I)
+_Q_APOS = re.compile(r"(?<=[A-Za-z])\?(?=(?:s|t|re|ve|ll|d|m)\b)", re.I)
+
+
+def fix_text(text):
+    """Best guess at what the API turned into '?', for an alert the feed
+    cannot restore. Only a '?' inside a word, between digits, or between
+    spaced words is touched; a real question mark ends a word and stays."""
+    t = text.replace(" ? ", " \u2013 ")                       # "Unavailable ? Weekends"
+    t = _Q_WORDS.sub(lambda m: m.group(1) + "\u2019" + m.group(2), t)   # nor'easter, o'clock
+    t = _Q_APOS.sub("\u2019", t)                              # TRANSIT?s, don?t, we?re
+    t = re.sub(r"(?<=\d)\?(?=\d)", "\u2013", t)               # ranges: 10?15 minutes
+    return re.sub(r"(?<=[A-Za-z])\?(?=[A-Za-z])", "-", t)     # the rest in a word: real?time
+
+
+def restore_text(text, original):
+    """NJ Transit's own characters when the feed's text is this alert
+    exactly, else the pattern repair. Text without a '?' is left alone."""
+    if "?" not in text:
+        return text
+    if original and _fold(original) == text:
+        return original
+    return fix_text(text)
+
+
 def fetch_alerts(token):
     rows = njt.api_post("getStationMSG", {"token": token, "station": njt.STATION, "line": ""})
     out, seen = [], set()
@@ -485,8 +575,9 @@ def fetch_alerts(token):
         if not isinstance(r, dict) or r.get("MSG_ID") in seen:
             continue
         seen.add(r.get("MSG_ID"))
-        # their feed garbles its dashes into " ? " ("Track 4 Unavailable ? Weekends")
-        text = html.unescape(str(r.get("MSG_TEXT") or "")).replace(" ? ", " - ").strip()
+        text = _squash(r.get("MSG_TEXT"))
+        if "?" in text:
+            text = restore_text(text, rss_original(str(r.get("MSG_ID") or "").strip()))
         if not text:
             continue
         m = _TRAIN_NO.search(text)
@@ -1032,7 +1123,7 @@ border-radius:8px;white-space:normal}
 align-items:center;justify-content:center;padding:16px}
 .modal[hidden]{display:none}
 .mbox{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:14px;
-max-width:480px;width:100%;max-height:85vh;overflow:auto;padding:16px 18px 18px;
+max-width:480px;width:100%;max-height:85vh;overflow-x:hidden;overflow-y:auto;padding:16px 18px 18px;
 box-shadow:0 16px 48px rgba(0,0,0,.3)}
 .mhead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;
 font-size:16px;font-weight:600;line-height:1.35}
@@ -1043,7 +1134,7 @@ cursor:pointer;padding:0 2px;flex-shrink:0}
 .mh{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);
 margin:14px 0 2px}
 .mmsg{font-size:13px;color:var(--dim);line-height:1.5;padding:8px 10px;background:var(--bg);
-border-radius:8px;margin-top:6px}
+border-radius:8px;margin-top:6px;overflow-wrap:anywhere}
 .mmsg a{color:inherit}
 .msub{font-size:12.5px;font-weight:400;color:var(--dim);margin-top:2px}
 .stops{list-style:none;margin:8px 0 0;padding:0}
@@ -1261,7 +1352,8 @@ function render(){
     let arr = '';
     // arrival time only for the destination the rider picked (issue 21)
     if(STOP){ const s=(t.stops||[]).find(s=>s.code===STOP.code); if(s && s.time) arr='arrives '+esc(STOP.name)+' at '+esc(s.time); }
-    const meta = [esc(t.line), t.depart?'departs at '+esc(t.depart):'', mins, arr].filter(Boolean).join(' \u00b7 ');
+    // the line is the colour bar on the card, and named in the details popup (issue 20)
+    const meta = [t.depart?'departs at '+esc(t.depart):'', mins, arr].filter(Boolean).join(' \u00b7 ');
     const warn = al.length ? '<button type="button" class="ibtn warnb" data-details data-train="'+esc(t.train)+
       '" title="Delay or alert - tap for details" aria-label="Delay or alert - details">\u26a0\ufe0e</button>' : '';
     const more = '<button type="button" class="ibtn" data-details data-train="'+esc(t.train)+
