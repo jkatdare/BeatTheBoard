@@ -31,9 +31,9 @@ Refreshed nightly from the live site by a GitHub Action
 
 | | |
 |---|---|
-| Coverage | 76.9% (727 of 945 trains called 60+ s before the board) |
-| Accuracy | 98.8% (718 of 727 predictions correct) |
-| BeatTheBoard, before departure | median 26.5 min, mean 29.9 min |
+| Coverage | 77.0% (736 of 956 trains called ≥ 1 minute before the board · 30 called too late to count) |
+| Accuracy | 98.8% (727 of 736 predictions correct) |
+| BeatTheBoard, before departure | median 26.6 min, mean 29.9 min |
 | NJ Transit board, before departure | median 10.2 min, mean 9.9 min |
 <!-- stats:end -->
 
