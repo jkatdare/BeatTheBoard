@@ -31,8 +31,8 @@ how it turned out, and serves the live scorecard at /api/stats.
 Three slower feeds ride along with the poll, each on its own timer: NJ
 Transit's rail alerts (getStationMSG, every ALERT_SECONDS) for the warning
 triangle, every train's stop list (getTrainSchedule, every STOPS_SECONDS) for
-the stop filter and arrival times, and the station list (getStationList, once
-a day) for the search box.
+the stop filter, arrival times and the train details popup, and the station
+list (getStationList, once a day) for the search box.
 
 Environment variables that matter for hosting:
     BIND         127.0.0.1 (default, this machine only) | 0.0.0.0 in a container
@@ -596,11 +596,47 @@ def train_state(item, notes):
     return out or ["On time"]
 
 
-# Every train's stop list, for the stop filter and arrival times. The 19Rec
-# board sends STOPS empty; the classic getTrainSchedule carries them, with
-# NJ Transit's current projection for each stop's time.
+# Every train's stop list, for the stop filter, arrival times and the train
+# details popup. The 19Rec board sends STOPS empty; the classic
+# getTrainSchedule carries them, with NJ Transit's current projection for each
+# stop's time.
 STOPS_SECONDS = int(os.environ.get("STOPS_SECONDS", "60"))
 STOPS = {"at": 0.0, "by_train": {}}
+
+_STOP_MINS = re.compile(r"(\d+)\s*MIN", re.I)
+
+
+def _stop_status(raw):
+    """NJ Transit's per-stop status in the page's words: 'OnTime' -> 'on time',
+    '45 MINS LATE' -> '45 min late', 'BOARDING' -> 'boarding'. Most stops
+    carry none, and blank stays blank."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    u = s.upper().replace(" ", "")
+    if u == "ONTIME":
+        return "on time"
+    if "CANCEL" in u:
+        return "canceled"
+    if "LATE" in u:
+        m = _STOP_MINS.search(s)
+        return "%s min late" % m.group(1) if m else "late"
+    return s.lower()
+
+
+def _stop(s):
+    """One stop for the page. TIME is NJ Transit's estimated arrival there: it
+    moves when the train runs late, while DEP_TIME stays on the timetable.
+    Status and departed are sent only when NJ Transit gives them."""
+    out = {"code": str(s.get("STATION_2CHAR") or "").strip(),
+           "name": str(s.get("STATIONNAME") or "").strip(),
+           "time": _clock(s.get("TIME"), "%d-%b-%Y %I:%M:%S %p")}
+    status = _stop_status(s.get("STOP_STATUS"))
+    if status:
+        out["status"] = status
+    if str(s.get("DEPARTED") or "").strip().upper() == "YES":
+        out["departed"] = True
+    return out
 
 
 def fetch_stops(token):
@@ -611,10 +647,7 @@ def fetch_stops(token):
         stops = item.get("STOPS")
         if not tid or not isinstance(stops, list):
             continue
-        out[tid] = [{"code": str(s.get("STATION_2CHAR") or "").strip(),
-                     "name": str(s.get("STATIONNAME") or "").strip(),
-                     "time": _clock(s.get("TIME"), "%d-%b-%Y %I:%M:%S %p")}
-                    for s in stops if isinstance(s, dict)]
+        out[tid] = [_stop(s) for s in stops if isinstance(s, dict)]
     return out
 
 
@@ -772,7 +805,7 @@ def build_board(books, hist, token):
             "circuit": circuits.get(tid),
             "arrived": arrived,
             "at": at,
-            "stops": tstops,                             # [{code, name, time}], NY first
+            "stops": tstops,                             # [{code, name, time, status?, departed?}], NY first
             "arrives": tstops[-1]["time"] if tstops else "",
             "alerts": notes,
             "state": train_state(item, notes),           # ["On time"] / ["Delayed up to 15 min", ...]
@@ -977,9 +1010,16 @@ color:var(--dim);font-size:14px}
 border-bottom:1px solid var(--line);border-left:4px solid transparent}
 .row:last-child{border-bottom:none}
 .main{flex:1;min-width:0}
-.dest{font-size:15px;font-weight:500;letter-spacing:-.01em;white-space:nowrap;
-overflow:hidden;text-overflow:ellipsis}
-.alert{color:var(--warn);cursor:pointer;margin-left:7px;font-size:15px}
+.dest{font-size:15px;font-weight:500;letter-spacing:-.01em}
+/* the buttons flow after the name like words, so a long destination wraps
+   onto a second line instead of being cut off */
+.dname{margin-right:3px}
+.ibtn{display:inline-flex;vertical-align:middle;align-items:center;justify-content:center;min-width:32px;
+height:28px;margin:-3px 0;padding:0 6px;border:none;border-radius:8px;background:transparent;
+color:var(--faint);font:inherit;font-size:15px;line-height:1;cursor:pointer}
+.ibtn:hover,.ibtn:focus-visible{background:var(--line);color:var(--fg);outline:none}
+.ibtn.warnb{color:var(--warn)}
+.ibtn svg{display:block;fill:currentColor}
 .meta{font-size:12.5px;color:var(--dim);margin-top:2px}
 .note{font-size:12px;color:var(--faint);margin-top:3px}
 .miss,.warnline{font-size:12px;color:var(--warn);margin-top:3px}
@@ -1005,6 +1045,21 @@ margin:14px 0 2px}
 .mmsg{font-size:13px;color:var(--dim);line-height:1.5;padding:8px 10px;background:var(--bg);
 border-radius:8px;margin-top:6px}
 .mmsg a{color:inherit}
+.msub{font-size:12.5px;font-weight:400;color:var(--dim);margin-top:2px}
+.stops{list-style:none;margin:8px 0 0;padding:0}
+.stop{position:relative;display:flex;align-items:baseline;gap:8px;padding:6px 0 6px 24px;font-size:14px}
+.stop::before{content:"";position:absolute;left:6px;top:0;bottom:0;width:3px;background:var(--lc,var(--faint))}
+.stop:first-child::before{top:50%}
+.stop:last-child::before{bottom:50%}
+.stop:only-child::before{display:none}
+.stop::after{content:"";position:absolute;left:1px;top:50%;width:13px;height:13px;margin-top:-6.5px;
+box-sizing:border-box;border-radius:50%;background:var(--card);border:3px solid var(--lc,var(--faint))}
+.sname{flex:1;min-width:0}
+.sst{font-size:11.5px;color:var(--faint);white-space:nowrap}
+.stime{color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+.stop.mine .sname,.stop.mine .stime{font-weight:600;color:var(--fg)}
+.stop.mine::after{background:var(--lc,var(--faint))}
+.stop.gone{opacity:.45}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;
 vertical-align:1px;background:var(--faint)}
 .dot.on{background:var(--ok)}
@@ -1040,6 +1095,7 @@ border-radius:12px;margin-bottom:9px;padding:15px 17px 15px 14px}
 .tokens b{font-variant-numeric:tabular-nums;font-weight:600}
 footer{margin-top:26px;font-size:12px;color:var(--faint);line-height:1.75}
 footer b{color:var(--dim);font-weight:500}
+footer svg{width:15px;height:15px;vertical-align:-3px;fill:var(--dim)}
 </style></head><body><div class="wrap">
 <div class="brand">BeatTheBoard</div>
 <div class="hd">
@@ -1059,22 +1115,26 @@ footer b{color:var(--dim);font-weight:500}
 <div class="tokens" id="tokens"></div>
 
 <footer>
-<div><b>confirmed</b> - we called it at least __MIN_LEAD__ s before NJ Transit posted the same track. Closer than that is not counted as beating the board.</div>
+<div><b>confirmed</b> - we called it at least __MIN_LEAD__ before NJ Transit posted the same track. Closer than that is not counted as beating the board.</div>
 <div><b>predicted</b> - our call; NJ Transit has not posted yet, so nothing has confirmed it. Capped at 99%: without their announcement it is never certain.</div>
 <div><b>on the board</b> - NJ Transit's posted track, with no confirmed call of ours behind it. Either we never predicted it, we called it too late to count, or we got it wrong - and it says so underneath.</div>
 <div><b>BTB +x mins</b> - how long before the scheduled departure we called the track. <b>NJT +x mins</b> - how long before departure NJ Transit posted it.</div>
-<div><b>\u26a0\ufe0e</b> - a delay, or an NJ Transit alert for this train or its whole line. Tap it to see whether this particular train is on time, late, canceled or making extra stops, and the full alert text.</div>
+<div><b>__DOTS__</b> - the train's stops and NJ Transit's estimated arrival time at each, like DepartureVision's train details. Any delay or alert shows above the stops.</div>
+<div><b>\u26a0\ufe0e</b> - a delay, or an NJ Transit alert for this train or its whole line. Tap it to see whether this particular train is on time, late, canceled or making extra stops, the full alert text, and its stops.</div>
 <div><b>usually</b> - where this train has gone on past days. Context, not a prediction.</div>
 <div>Type your destination above to see only the trains that stop there, with the time they get there. It is remembered on this device. The dot shows whether the train is reporting from Penn yet. Always confirm on the station display before boarding.</div>
 </footer></div>
-<div class="modal" id="modal" hidden><div class="mbox">
+<div class="modal" id="modal" hidden><div class="mbox" role="dialog" aria-modal="true" aria-labelledby="mtitle">
 <div class="mhead"><div id="mtitle"></div><button id="mclose" type="button" aria-label="Close">&times;</button></div>
 <div id="mbody"></div>
 </div></div>
 <script>
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 let STATIONS = [], STOP = null, BOARD = null;
-let MODAL = null;                             // train whose warning popup is open
+let MODAL = null, LASTM = '';                 // train whose details popup is open, and its last render
+const DOTS = '__DOTS__';
+// NJ Transit line colours go into style attributes, so accept hex colours only
+const col = c => /^#[0-9a-fA-F]{3,8}$/.test(c || '') ? c : '';
 const inp = document.getElementById('stop'), menu = document.getElementById('menu');
 // the home stop is remembered on this device
 try{ STOP = JSON.parse(localStorage.getItem('btb-stop') || 'null'); }catch(e){ STOP = null; }
@@ -1107,15 +1167,25 @@ menu.addEventListener('pointerdown', e=>{
 });
 document.addEventListener('click', e=>{ if(!e.target.closest('.find')) menu.innerHTML = ''; });
 document.getElementById('clear').addEventListener('click', ()=>{ setStop(null); inp.focus(); });
+// the dots and the warning triangle both open the same details popup
 document.getElementById('rows').addEventListener('click', e=>{
-  const a = e.target.closest('.alert'); if(!a) return;
-  MODAL = a.dataset.train; renderModal();
+  const b = e.target.closest('[data-details]'); if(!b) return;
+  MODAL = b.dataset.train; LASTM = ''; renderModal();
+  if(!modal.hidden) document.getElementById('mclose').focus({preventScroll:true});
 });
 const modal = document.getElementById('modal');
-function closeModal(){ MODAL = null; modal.hidden = true; }
+function closeModal(){
+  const id = MODAL; MODAL = null; LASTM = ''; modal.hidden = true;
+  // hand focus back to the train's button (the rows are re-rendered every poll)
+  const b = [...document.querySelectorAll('[data-details]')].find(x=>x.dataset.train===id);
+  if(b) b.focus({preventScroll:true});
+}
 modal.addEventListener('click', e=>{ if(e.target === modal || e.target.closest('#mclose')) closeModal(); });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape' && MODAL) closeModal(); });
-// the popup is rebuilt from the latest board on every poll while it is open
+// The details popup: this train's state, any alerts, then its stops with
+// NJ Transit's estimated arrival at each (DepartureVision's train details).
+// Rebuilt from each new board while open, but only touched when something
+// changed, so it keeps its scroll position.
 function renderModal(){
   if(!MODAL || !BOARD){ modal.hidden = true; return; }
   const t = BOARD.trains.find(x=>x.train===MODAL);
@@ -1126,13 +1196,26 @@ function renderModal(){
   const msg = a => '<div class="mmsg">'+esc(a.text)+
     (a.when?' <span class="faint">\u00b7 posted '+esc(a.when)+'</span>':'')+
     (a.url?' <a href="'+esc(a.url)+'" target="_blank" rel="noopener">details</a>':'')+'</div>';
-  document.getElementById('mtitle').innerHTML = esc(t.destination)+
-    ' <span class="faint">\u00b7 train '+esc(t.train)+(t.depart?' \u00b7 departs at '+esc(t.depart):'')+'</span>';
-  document.getElementById('mbody').innerHTML =
+  const stops = t.stops || [], lc = col(t.color);
+  const title = '<div>'+esc(t.destination)+'</div><div class="msub">'+
+    [esc(t.line), 'train '+esc(t.train), t.depart?'departs at '+esc(t.depart):''].filter(Boolean).join(' \u00b7 ')+'</div>';
+  const body =
     '<div class="mstate'+(state.some(s=>s!=='On time')?' bad':'')+'">This train: '+esc(state.join(' \u00b7 '))+'</div>'+
     (own.length ? '<div class="mh">About this train</div>'+own.map(msg).join('') : '')+
     (line.length ? '<div class="mh">'+esc(t.line)+(own.length?'':' - nothing names this train')+'</div>'+line.map(msg).join('') : '')+
-    (!own.length && !line.length ? '<div class="mmsg">No NJ Transit message for this train; the state above comes from the board.</div>' : '');
+    '<div class="mh">Stops \u00b7 estimated arrival</div>'+
+    (stops.length
+      ? '<ol class="stops"'+(lc?' style="--lc:'+lc+'"':'')+'>'+stops.map(s=>
+          '<li class="stop'+(STOP && s.code===STOP.code?' mine':'')+(s.departed?' gone':'')+'">'+
+          '<span class="sname">'+esc(s.name)+'</span>'+
+          (s.departed?'<span class="sst">departed</span>':(s.status?'<span class="sst">'+esc(s.status)+'</span>':''))+
+          '<span class="stime">'+esc(s.time)+'</span></li>').join('')+'</ol>'
+      : '<div class="mmsg">The stop list has not loaded yet. It refreshes once a minute.</div>');
+  if(title + body !== LASTM){
+    LASTM = title + body;
+    document.getElementById('mtitle').innerHTML = title;
+    document.getElementById('mbody').innerHTML = body;
+  }
   modal.hidden = false;
 }
 
@@ -1168,7 +1251,7 @@ function render(){
     if(p.tier==='verified'){ num=p.track; ncls='ok'; tcls='ok'; tier='confirmed'; }
     else if(p.tier==='official'){ num=p.track; ncls='ok'; tcls='off'; tier='on the board';
       if(p.missed) extra+='<div class="miss">predicted track '+esc(p.missed)+' was wrong</div>';
-      else if(p.late) extra+='<div class="cand">we called it too, but under __MIN_LEAD__ s before NJ Transit did - not counted</div>'; }
+      else if(p.late) extra+='<div class="cand">we called it too, but under __MIN_LEAD__ before NJ Transit did - not counted</div>'; }
     else if(p.tier==='predicted'){ num=p.track; ncls='pred'; tcls='pred';
       tier='predicted'+(p.confidence?' '+Math.min(99,Math.round(p.confidence*100))+'%':''); }
     else if(p.tier==='history'){ tcls='off'; tier='no signal';
@@ -1179,9 +1262,12 @@ function render(){
     // arrival time only for the destination the rider picked (issue 21)
     if(STOP){ const s=(t.stops||[]).find(s=>s.code===STOP.code); if(s && s.time) arr='arrives '+esc(STOP.name)+' at '+esc(s.time); }
     const meta = [esc(t.line), t.depart?'departs at '+esc(t.depart):'', mins, arr].filter(Boolean).join(' \u00b7 ');
-    const icon = al.length ? '<span class="alert" data-train="'+esc(t.train)+'" title="Delay or alert - tap to see how this train is doing">\u26a0\ufe0e</span>' : '';
-    return '<div class="row" style="border-left-color:'+(esc(t.color)||'transparent')+'">'+
-      '<div class="main"><div class="dest">'+esc(t.destination)+icon+'</div>'+
+    const warn = al.length ? '<button type="button" class="ibtn warnb" data-details data-train="'+esc(t.train)+
+      '" title="Delay or alert - tap for details" aria-label="Delay or alert - details">\u26a0\ufe0e</button>' : '';
+    const more = '<button type="button" class="ibtn" data-details data-train="'+esc(t.train)+
+      '" title="Stops and times" aria-label="Stops and times">'+DOTS+'</button>';
+    return '<div class="row" style="border-left-color:'+(col(t.color)||'transparent')+'">'+
+      '<div class="main"><div class="dest"><span class="dname">'+esc(t.destination)+'</span>'+warn+more+'</div>'+
       '<div class="meta"><span class="dot'+(t.arrived?' on':'')+'"></span>'+meta+'</div>'+
       extra+'</div>'+
       '<div class="right"><div class="trk '+ncls+'">'+esc(num)+'</div>'+
@@ -1221,10 +1307,11 @@ async function score(){
     document.getElementById('scorewhen').textContent =
       '\u00b7 '+s.days+(s.days===1?' day':' days')+' \u00b7 '+us(s.first_day)+' to '+us(s.last_day);
     const m = v => (v===null||v===undefined)?'--':v+' min';
+    const dur = n => n && n%60===0 ? (n/60)+'\u00a0'+(n===60?'minute':'minutes') : n+'\u00a0seconds';
     const it = (k,v,n) => '<div class="sitem"><div class="sk">'+k+'</div><div class="sv">'+v+
       '</div><div class="sn">'+(n||'')+'</div></div>';
     g.innerHTML =
-      it('Coverage', s.coverage+'%', s.predicted+' of '+s.scored+' trains called '+s.min_lead+'+ s before the board'+
+      it('Coverage', s.coverage+'%', s.predicted+' of '+s.scored+' trains called \u2265\u00a0'+dur(s.min_lead)+' before the board'+
          (s.late ? ' \u00b7 '+s.late+' called too late to count' : '')) +
       it('Accuracy', s.accuracy===null?'--':s.accuracy+'%',
          s.correct+' of '+s.predicted+' predictions correct') +
@@ -1236,10 +1323,25 @@ tick();
 score(); setInterval(score, 30000);
 </script></body></html>"""
 
+def _dur(sec):
+    """How the page states the beat-the-board rule: 60 -> '1 minute',
+    120 -> '2 minutes', 45 -> '45 seconds'."""
+    if sec and sec % 60 == 0:
+        return "%d minute%s" % (sec // 60, "" if sec == 60 else "s")
+    return "%d seconds" % sec
+
+
+# The details button's three dots, drawn rather than typed so they look the
+# same on every phone. Used on each train and in the footer legend.
+DOTS_SVG = ('<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">'
+            '<circle cx="4" cy="10" r="1.9"/><circle cx="10" cy="10" r="1.9"/>'
+            '<circle cx="16" cy="10" r="1.9"/></svg>')
+
 # __TICK_MS__ is the page's fallback interval; normally it times itself to
 # the poller (see tick() in the script above).
 PAGE = (PAGE.replace("__TICK_MS__", str(max(2, POLL_SECONDS or 15) * 1000))
-            .replace("__MIN_LEAD__", str(stats.MIN_LEAD)))
+            .replace("__MIN_LEAD__", _dur(stats.MIN_LEAD))
+            .replace("__DOTS__", DOTS_SVG))
 
 
 def main():

@@ -26,14 +26,17 @@ jobs:
           s = json.load(urllib.request.urlopen("https://beattheboard.net/api/stats", timeout=30))
           us = lambda d: "%s-%s-%s" % (d[5:7], d[8:10], d[0:4]) if d else ""
           m = lambda v: "--" if v is None else "%s min" % v
+          # same wording as the page: "called >= 1 minute before the board"
+          dur = lambda n: ("%d minute%s" % (n // 60, "" if n == 60 else "s")) if n and n % 60 == 0 else "%d seconds" % n
           if s.get("scored"):
               block = "\n".join([
                   "%d days, %s to %s" % (s["days"], us(s["first_day"]), us(s["last_day"])),
                   "",
                   "| | |",
                   "|---|---|",
-                  "| Coverage | %s%% (%d of %d trains called %d+ s before the board) |"
-                  % (s["coverage"], s["predicted"], s["scored"], s["min_lead"]),
+                  "| Coverage | %s%% (%d of %d trains called \u2265 %s before the board%s) |"
+                  % (s["coverage"], s["predicted"], s["scored"], dur(s["min_lead"]),
+                     " \u00b7 %d called too late to count" % s["late"] if s.get("late") else ""),
                   "| Accuracy | %s (%d of %d predictions correct) |"
                   % ("--" if s["accuracy"] is None else "%s%%" % s["accuracy"], s["correct"], s["predicted"]),
                   "| BeatTheBoard, before departure | median %s, mean %s |" % (m(s["ours_median"]), m(s["ours_mean"])),

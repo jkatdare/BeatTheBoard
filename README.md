@@ -17,6 +17,7 @@ Other information shown:
 - minutes before departure BeatTheBoard called the track, as BTB + xx mins
 - minutes before NJ Transit called the track, as NJT + xx mins
 - delays as a warning triangle with details in a popup when clicked
+- train details from the three dots next to each destination: every stop with NJ Transit's estimated arrival time, like DepartureVision, with any delay or alert above it
 
 ** destination is cached on your local device, use the same browser and avoid incognito mode
 
