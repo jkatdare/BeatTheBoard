@@ -27,13 +27,13 @@ Refreshed nightly from the live site by a GitHub Action
 (.github/workflows/readme-stats.yml). Same numbers as the bottom of the page.
 
 <!-- stats:start -->
-69 days, 09-17-2026 to 11-24-2026
+70 days, 09-17-2026 to 11-25-2026
 
 | | |
 |---|---|
-| Coverage | 78.7% (6336 of 8049 trains called ≥ 1 minute before the board · 153 called too late to count) |
-| Accuracy | 98.6% (6247 of 6336 predictions correct) |
-| BeatTheBoard, before departure | median 29.4 min, mean 33.2 min |
+| Coverage | 78.7% (6460 of 8212 trains called ≥ 1 minute before the board · 157 called too late to count) |
+| Accuracy | 98.6% (6370 of 6460 predictions correct) |
+| BeatTheBoard, before departure | median 29.3 min, mean 33.1 min |
 | NJ Transit board, before departure | median 9.8 min, mean 9.2 min |
 <!-- stats:end -->
 
